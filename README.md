@@ -60,6 +60,10 @@ py .\tc001_thermal_viewer_v5.py --sdk-raw
 
 Lenh nay la che do nen dung khi can do nhiet do that.
 
+Project nay co chu y khong mo camera index `0`. Tat ca OpenCV visual/RGB va AI
+mac dinh dung camera index `1`. Neu truyen `--device 0` hoac `--rgb-device 0`,
+chuong trinh se dung ngay de tranh mo webcam tich hop.
+
 ## AI do tran va canh bao vat nong
 
 AI chay theo kien truc 2 luong:
@@ -142,7 +146,7 @@ strip` thuong can train/fine-tune model rieng de chinh xac.
 Liet ke camera OpenCV:
 
 ```powershell
-py .\tc001_thermal_viewer_v5.py --list
+py .\tc001_thermal_viewer_v5.py --list --scan-min 1
 ```
 
 Mo camera OpenCV index 1 de xem visual stream:
@@ -154,7 +158,7 @@ py .\tc001_thermal_viewer_v5.py --device 1
 Thu scan raw/radiometric qua OpenCV:
 
 ```powershell
-py .\tc001_thermal_viewer_v5.py --find-raw --scan-max 5
+py .\tc001_thermal_viewer_v5.py --find-raw --scan-min 1 --scan-max 5
 ```
 
 Che do estimate tu visual frame, chi de tham khao:

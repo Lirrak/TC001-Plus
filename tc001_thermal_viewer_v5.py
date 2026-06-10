@@ -23,7 +23,7 @@ Normal visual viewer:
     py tc001_thermal_viewer_v5.py --device 1 --rotate 90
 
 Scan for radiometric/raw mode:
-    py tc001_thermal_viewer_v5.py --find-raw --scan-max 5
+    py tc001_thermal_viewer_v5.py --find-raw --scan-min 1 --scan-max 5
 
 Try raw/radiometric mode directly:
     py tc001_thermal_viewer_v5.py --device 1 --backend dshow --raw-request --raw-format --probe
@@ -63,6 +63,7 @@ WINDOW_NAME = "TOPDON TC001 Thermal Viewer v5"
 TC001_WIDTH = 256
 TC001_HEIGHT = 192
 TC001_FPS = 25
+DEFAULT_OPENCV_CAMERA_INDEX = 1
 
 COLORMAPS: Tuple[Tuple[str, int], ...] = tuple(
     (name, cmap)
@@ -490,6 +491,7 @@ def describe_frame(frame: np.ndarray) -> str:
 
 
 def list_video_devices(
+    min_index: int = DEFAULT_OPENCV_CAMERA_INDEX,
     max_index: int = 3,
     width: int = TC001_WIDTH,
     height: int = TC001_HEIGHT,
@@ -499,7 +501,7 @@ def list_video_devices(
     print("Scanning video device indexes...")
     found = []
 
-    for idx in range(max_index + 1):
+    for idx in range(max(1, int(min_index)), max_index + 1):
         cap, used_backend = open_camera(
             idx,
             width,
@@ -1227,7 +1229,7 @@ def probe_raw_streams(args: argparse.Namespace) -> int:
 
     any_radiometric = False
 
-    for idx in range(args.scan_max + 1):
+    for idx in range(max(1, int(args.scan_min)), int(args.scan_max) + 1):
         for backend_name, _backend_value in backend_candidates(args.backend):
             for label, opt in configs:
                 cap, used_backend = open_camera(
@@ -1704,9 +1706,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Live false-color viewer for TOPDON TC001/TC001 Plus thermal camera on Windows."
     )
-    parser.add_argument("-d", "--device", type=int, default=1, help="OpenCV video device number, e.g. 0, 1, 2. Default: 1.")
+    parser.add_argument("-d", "--device", type=int, default=DEFAULT_OPENCV_CAMERA_INDEX, help="OpenCV video device number. Camera 0 is intentionally blocked. Default: 1.")
     parser.add_argument("--list", action="store_true", help="Scan and list readable OpenCV video device indexes.")
     parser.add_argument("--find-raw", action="store_true", help="Scan camera/backend/format combinations for radiometric temperature data.")
+    parser.add_argument("--scan-min", type=int, default=DEFAULT_OPENCV_CAMERA_INDEX, help="Lowest camera index to scan. Camera 0 is intentionally skipped. Default: 1.")
     parser.add_argument("--scan-max", type=int, default=3, help="Highest camera index to scan. Default: 3.")
     parser.add_argument("--backend", choices=["auto", "msmf", "dshow", "any"], default="auto", help="OpenCV backend. Default: auto.")
     parser.add_argument("--width", type=int, default=TC001_WIDTH, help="Raw thermal width. Default: 256.")
@@ -1744,7 +1747,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hot-object-watch", action="store_true", help="Enable thermal hot-object detection and optional YOLO labels.")
     parser.add_argument("--calibrate-ai", action="store_true", help="Open a 4-point RGB-to-thermal calibration window and save --alignment-file.")
     parser.add_argument("--alignment-file", default="tc001_alignment.json", help="AI calibration file. Default: tc001_alignment.json.")
-    parser.add_argument("--rgb-device", type=int, default=1, help="OpenCV RGB/visual camera index for AI. Default: 1.")
+    parser.add_argument("--rgb-device", type=int, default=DEFAULT_OPENCV_CAMERA_INDEX, help="OpenCV RGB/visual camera index for AI. Camera 0 is intentionally blocked. Default: 1.")
     parser.add_argument("--rgb-backend", choices=["auto", "msmf", "dshow", "any"], default="auto", help="OpenCV backend for AI RGB camera. Default: auto.")
     parser.add_argument("--rgb-width", type=int, default=640, help="Requested RGB camera width for AI. Default: 640.")
     parser.add_argument("--rgb-height", type=int, default=480, help="Requested RGB camera height for AI. Default: 480.")
@@ -1774,13 +1777,22 @@ def main() -> int:
     args = parse_args()
 
     if args.list:
-        list_video_devices(args.scan_max, args.width, args.height, args.fps, args.backend)
+        list_video_devices(args.scan_min, args.scan_max, args.width, args.height, args.fps, args.backend)
         return 0
 
     if args.find_raw:
         return probe_raw_streams(args)
 
     device = args.device
+    ai_requested = bool(args.ai_forehead or args.hot_object_watch or args.calibrate_ai)
+
+    if device == 0:
+        print("ERROR: Camera index 0 is blocked by design. Use --device 1 for TC001 Plus/OpenCV visual mode.")
+        return 2
+    if ai_requested and int(args.rgb_device) == 0:
+        print("ERROR: AI RGB camera index 0 is blocked by design. Use --rgb-device 1.")
+        return 2
+
     if device is None:
         print("No --device was provided.")
         print("Use --list first, then run for example: py tc001_thermal_viewer_v5.py --device 1")
@@ -1794,6 +1806,9 @@ def main() -> int:
             device = int(typed)
         except ValueError:
             print("ERROR: Device number must be an integer such as 0, 1, or 2.")
+            return 2
+        if device == 0:
+            print("ERROR: Camera index 0 is blocked by design. Use camera index 1.")
             return 2
 
     state = ViewerState(
@@ -1824,7 +1839,6 @@ def main() -> int:
     rgb_cap: Optional[cv2.VideoCapture] = None
     sdk_cam: Optional[TC001SdkCamera] = None
     ai: Optional[ThermalAI] = None
-    ai_requested = bool(args.ai_forehead or args.hot_object_watch or args.calibrate_ai)
 
     if args.sdk_raw:
         print("Opening TC001 Plus through TOPDON SDK/libiruvc real radiometric stream...")
