@@ -23,7 +23,7 @@ Normal visual viewer:
     py tc001_thermal_viewer_v5.py --device 1 --rotate 90
 
 Scan for radiometric/raw mode:
-    py tc001_thermal_viewer_v5.py --find-raw --scan-min 1 --scan-max 5
+    py tc001_thermal_viewer_v5.py --find-raw --scan-max 5
 
 Try raw/radiometric mode directly:
     py tc001_thermal_viewer_v5.py --device 1 --backend dshow --raw-request --raw-format --probe
@@ -41,7 +41,6 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import argparse
 import ctypes
-import json
 import platform
 import sys
 import time
@@ -63,7 +62,6 @@ WINDOW_NAME = "TOPDON TC001 Thermal Viewer v5"
 TC001_WIDTH = 256
 TC001_HEIGHT = 192
 TC001_FPS = 25
-DEFAULT_OPENCV_CAMERA_INDEX = 1
 
 COLORMAPS: Tuple[Tuple[str, int], ...] = tuple(
     (name, cmap)
@@ -491,7 +489,6 @@ def describe_frame(frame: np.ndarray) -> str:
 
 
 def list_video_devices(
-    min_index: int = DEFAULT_OPENCV_CAMERA_INDEX,
     max_index: int = 3,
     width: int = TC001_WIDTH,
     height: int = TC001_HEIGHT,
@@ -501,7 +498,7 @@ def list_video_devices(
     print("Scanning video device indexes...")
     found = []
 
-    for idx in range(max(1, int(min_index)), max_index + 1):
+    for idx in range(max_index + 1):
         cap, used_backend = open_camera(
             idx,
             width,
@@ -628,819 +625,6 @@ def split_frame_if_needed(frame: np.ndarray, split_mode: int) -> np.ndarray:
     return frame
 
 
-@dataclass
-class ForeheadMeasurement:
-    rgb_poly: np.ndarray
-    thermal_poly: np.ndarray
-    temp_c: Optional[float]
-    status: str
-    calibrated: bool
-    head_bbox: Optional[Tuple[int, int, int, int]] = None
-    face_bbox: Optional[Tuple[int, int, int, int]] = None
-    face_confidence: Optional[float] = None
-
-
-@dataclass
-class HotObjectMeasurement:
-    bbox: Tuple[int, int, int, int]
-    centroid: Tuple[float, float]
-    max_c: float
-    avg_c: float
-    area: int
-    persistent_s: float
-    label: Optional[str]
-    confidence: Optional[float]
-    alert: bool
-
-
-@dataclass
-class AIOverlay:
-    forehead: Optional[ForeheadMeasurement]
-    hot_objects: List[HotObjectMeasurement]
-    status_lines: List[str]
-
-
-class AlignmentMap:
-    def __init__(
-        self,
-        matrix: Optional[np.ndarray],
-        rgb_size: Optional[Tuple[int, int]],
-        thermal_size: Optional[Tuple[int, int]],
-        source: str,
-    ) -> None:
-        self.matrix = matrix
-        self.rgb_size = rgb_size
-        self.thermal_size = thermal_size
-        self.source = source
-
-    @property
-    def calibrated(self) -> bool:
-        return self.matrix is not None
-
-    @classmethod
-    def load(cls, path: str) -> "AlignmentMap":
-        if not os.path.exists(path):
-            return cls(None, None, None, "rough-scale")
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        matrix = np.asarray(data.get("homography"), dtype=np.float32)
-        if matrix.shape != (3, 3):
-            raise ValueError(f"Invalid homography in {path}")
-        rgb_size_data = data.get("rgb_size")
-        thermal_size_data = data.get("thermal_size")
-        rgb_size = tuple(int(v) for v in rgb_size_data) if rgb_size_data else None
-        thermal_size = tuple(int(v) for v in thermal_size_data) if thermal_size_data else None
-        return cls(matrix, rgb_size, thermal_size, path)
-
-    def map_rgb_to_thermal(
-        self,
-        points: np.ndarray,
-        rgb_shape: Tuple[int, int],
-        thermal_shape: Tuple[int, int],
-    ) -> np.ndarray:
-        pts = np.asarray(points, dtype=np.float32).reshape((-1, 1, 2))
-        th, tw = thermal_shape[:2]
-        rh, rw = rgb_shape[:2]
-
-        if self.matrix is not None:
-            mapped = cv2.perspectiveTransform(pts, self.matrix).reshape((-1, 2))
-        else:
-            sx = tw / max(rw, 1)
-            sy = th / max(rh, 1)
-            mapped = points.astype(np.float32).copy()
-            mapped[:, 0] *= sx
-            mapped[:, 1] *= sy
-
-        mapped[:, 0] = np.clip(mapped[:, 0], 0, max(0, tw - 1))
-        mapped[:, 1] = np.clip(mapped[:, 1], 0, max(0, th - 1))
-        return mapped
-
-    def map_thermal_to_rgb(
-        self,
-        points: np.ndarray,
-        rgb_shape: Tuple[int, int],
-        thermal_shape: Tuple[int, int],
-    ) -> np.ndarray:
-        pts = np.asarray(points, dtype=np.float32).reshape((-1, 1, 2))
-        th, tw = thermal_shape[:2]
-        rh, rw = rgb_shape[:2]
-
-        if self.matrix is not None:
-            inv = np.linalg.inv(self.matrix)
-            mapped = cv2.perspectiveTransform(pts, inv.astype(np.float32)).reshape((-1, 2))
-        else:
-            sx = rw / max(tw, 1)
-            sy = rh / max(th, 1)
-            mapped = points.astype(np.float32).copy()
-            mapped[:, 0] *= sx
-            mapped[:, 1] *= sy
-
-        mapped[:, 0] = np.clip(mapped[:, 0], 0, max(0, rw - 1))
-        mapped[:, 1] = np.clip(mapped[:, 1], 0, max(0, rh - 1))
-        return mapped
-
-
-class FaceForeheadDetector:
-    def __init__(self, max_faces: int = 2) -> None:
-        self.error: Optional[str] = None
-        self.face_mesh: Optional[Any] = None
-        try:
-            import mediapipe as mp  # type: ignore
-
-            self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=max_faces,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-        except Exception as exc:
-            self.error = f"MediaPipe unavailable: {exc}"
-
-    def detect_forehead_poly(self, bgr_frame: np.ndarray) -> Optional[np.ndarray]:
-        if self.face_mesh is None:
-            return None
-
-        h, w = bgr_frame.shape[:2]
-        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb)
-        faces = getattr(results, "multi_face_landmarks", None)
-        if not faces:
-            return None
-
-        best_points: Optional[np.ndarray] = None
-        best_area = -1.0
-        for face in faces:
-            pts = np.asarray([(lm.x * w, lm.y * h) for lm in face.landmark], dtype=np.float32)
-            if pts.size == 0:
-                continue
-            x0, y0 = np.nanmin(pts, axis=0)
-            x1, y1 = np.nanmax(pts, axis=0)
-            bw = max(1.0, float(x1 - x0))
-            bh = max(1.0, float(y1 - y0))
-            area = bw * bh
-            if area <= best_area:
-                continue
-
-            cx = float((x0 + x1) / 2.0)
-            top = float(y0 + 0.10 * bh)
-            bottom = float(y0 + 0.30 * bh)
-            left_top = float(cx - 0.18 * bw)
-            right_top = float(cx + 0.18 * bw)
-            left_bottom = float(cx - 0.16 * bw)
-            right_bottom = float(cx + 0.16 * bw)
-            poly = np.asarray(
-                [
-                    [left_top, top],
-                    [right_top, top],
-                    [right_bottom, bottom],
-                    [left_bottom, bottom],
-                ],
-                dtype=np.float32,
-            )
-            poly[:, 0] = np.clip(poly[:, 0], 0, w - 1)
-            poly[:, 1] = np.clip(poly[:, 1], 0, h - 1)
-            best_points = poly
-            best_area = area
-
-        return best_points
-
-
-class YoloObjectDetector:
-    def __init__(self, model_name: str, enabled: bool) -> None:
-        self.model: Optional[Any] = None
-        self.names: Dict[int, str] = {}
-        self.error: Optional[str] = None
-        if not enabled:
-            return
-        try:
-            yolo_config_dir = os.path.abspath(".ultralytics")
-            os.makedirs(yolo_config_dir, exist_ok=True)
-            os.environ.setdefault("YOLO_CONFIG_DIR", yolo_config_dir)
-            from ultralytics import YOLO  # type: ignore
-
-            self.model = YOLO(model_name)
-            names = getattr(self.model, "names", {}) or {}
-            self.names = {int(k): str(v) for k, v in names.items()} if isinstance(names, dict) else {}
-        except Exception as exc:
-            self.error = f"YOLO unavailable: {exc}"
-
-    def detect(self, bgr_frame: np.ndarray, conf: float) -> List[Dict[str, Any]]:
-        if self.model is None:
-            return []
-        try:
-            results = self.model.predict(bgr_frame, conf=conf, verbose=False)
-        except Exception as exc:
-            self.error = f"YOLO predict failed: {exc}"
-            return []
-
-        detections: List[Dict[str, Any]] = []
-        for result in results:
-            boxes = getattr(result, "boxes", None)
-            if boxes is None:
-                continue
-            for box in boxes:
-                xyxy = box.xyxy[0].detach().cpu().numpy().astype(float)
-                cls_id = int(box.cls[0].detach().cpu().item())
-                score = float(box.conf[0].detach().cpu().item())
-                detections.append(
-                    {
-                        "bbox": (xyxy[0], xyxy[1], xyxy[2], xyxy[3]),
-                        "label": self.names.get(cls_id, str(cls_id)),
-                        "confidence": score,
-                    }
-                )
-        return detections
-
-
-class HotSpotTracker:
-    def __init__(self) -> None:
-        self.next_id = 1
-        self.tracks: Dict[int, Dict[str, Any]] = {}
-
-    def update(self, spots: List[Dict[str, Any]], now: float, max_distance: float = 18.0) -> List[Dict[str, Any]]:
-        assigned: set[int] = set()
-
-        for spot in spots:
-            cx, cy = spot["centroid"]
-            best_id: Optional[int] = None
-            best_dist = max_distance
-            for track_id, track in self.tracks.items():
-                if track_id in assigned:
-                    continue
-                tx, ty = track["centroid"]
-                dist = float(np.hypot(cx - tx, cy - ty))
-                if dist <= best_dist:
-                    best_id = track_id
-                    best_dist = dist
-
-            if best_id is None:
-                best_id = self.next_id
-                self.next_id += 1
-                self.tracks[best_id] = {"first_seen": now, "last_seen": now, "centroid": (cx, cy)}
-            else:
-                self.tracks[best_id]["last_seen"] = now
-                self.tracks[best_id]["centroid"] = (cx, cy)
-
-            assigned.add(best_id)
-            spot["track_id"] = best_id
-            spot["persistent_s"] = now - float(self.tracks[best_id]["first_seen"])
-
-        stale = [track_id for track_id, track in self.tracks.items() if now - float(track["last_seen"]) > 2.0]
-        for track_id in stale:
-            self.tracks.pop(track_id, None)
-
-        return spots
-
-
-class ThermalAI:
-    def __init__(self, args: argparse.Namespace) -> None:
-        self.args = args
-        self.alignment = AlignmentMap.load(args.alignment_file)
-        self.face = FaceForeheadDetector() if args.ai_forehead and args.ai_rgb_face else None
-        self.yolo = YoloObjectDetector(args.ai_object_model, args.hot_object_watch and args.ai_use_yolo)
-        self.hot_tracker = HotSpotTracker()
-        self.frame_index = 0
-        self.last_forehead_poly: Optional[np.ndarray] = None
-        self.last_head_bbox: Optional[Tuple[float, float, float, float]] = None
-        self.last_yolo_detections: List[Dict[str, Any]] = []
-        self.risk_classes = [
-            item.strip().lower()
-            for item in str(args.risk_classes).split(",")
-            if item.strip()
-        ]
-
-    def needs_rgb(self) -> bool:
-        face_needs_rgb = self.face is not None and self.face.face_mesh is not None
-        yolo_needs_rgb = self.yolo is not None and self.yolo.model is not None
-        return bool(face_needs_rgb or yolo_needs_rgb)
-
-    def status_lines(self) -> List[str]:
-        lines: List[str] = []
-        if self.alignment.calibrated:
-            lines.append(f"AI align: {self.alignment.source}")
-        else:
-            if self.args.thermal_forehead_fallback:
-                lines.append("AI align: thermal fallback active")
-            else:
-                lines.append("AI align: rough scale only; run --calibrate-ai")
-        if self.face is not None and self.face.error:
-            if self.args.thermal_forehead_fallback:
-                lines.append("MediaPipe unavailable; using thermal face detection")
-            else:
-                lines.append(self.face.error)
-        if self.yolo is not None and self.yolo.error:
-            lines.append(self.yolo.error)
-        return lines
-
-    def analyze(self, rgb_frame: Optional[np.ndarray], temp_c: Optional[np.ndarray]) -> AIOverlay:
-        if temp_c is None:
-            return AIOverlay(None, [], ["AI needs real temperature matrix"])
-
-        self.frame_index += 1
-        forehead = self._measure_forehead(rgb_frame, temp_c) if self.args.ai_forehead else None
-        hot_objects = self._measure_hot_objects(rgb_frame, temp_c, forehead) if self.args.hot_object_watch else []
-        return AIOverlay(forehead, hot_objects, self.status_lines())
-
-    def _measure_forehead(self, rgb_frame: Optional[np.ndarray], temp_c: np.ndarray) -> Optional[ForeheadMeasurement]:
-        thermal_shape = temp_c.shape[:2]
-
-        if self.face is not None and self.face.face_mesh is not None and rgb_frame is not None:
-            rgb_shape = rgb_frame.shape[:2]
-            if self.frame_index % max(1, int(self.args.ai_every_n)) == 1 or self.last_forehead_poly is None:
-                poly = self.face.detect_forehead_poly(rgb_frame)
-                if poly is not None:
-                    self.last_forehead_poly = poly
-
-            if self.last_forehead_poly is None:
-                return ForeheadMeasurement(
-                    rgb_poly=np.zeros((0, 2), dtype=np.float32),
-                    thermal_poly=np.zeros((0, 2), dtype=np.float32),
-                    temp_c=None,
-                    status="no-face",
-                    calibrated=self.alignment.calibrated,
-                )
-
-            thermal_poly = self.alignment.map_rgb_to_thermal(self.last_forehead_poly, rgb_shape, thermal_shape)
-            face_bbox = self._bbox_from_poly(thermal_poly, thermal_shape)
-            return self._measure_forehead_poly(
-                self.last_forehead_poly.copy(),
-                thermal_poly,
-                temp_c,
-                self.alignment.calibrated,
-                head_bbox=face_bbox,
-                face_bbox=face_bbox,
-                face_confidence=0.95,
-            )
-
-        if self.args.thermal_forehead_fallback:
-            return self._measure_forehead_from_thermal(temp_c)
-
-        return None
-
-    def _measure_forehead_from_thermal(self, temp_c: np.ndarray) -> ForeheadMeasurement:
-        thermal_shape = temp_c.shape[:2]
-        head_bbox = self._track_head_from_thermal(temp_c)
-        if head_bbox is None:
-            return ForeheadMeasurement(
-                rgb_poly=np.zeros((0, 2), dtype=np.float32),
-                thermal_poly=np.zeros((0, 2), dtype=np.float32),
-                temp_c=None,
-                status="thermal-no-head",
-                calibrated=False,
-                head_bbox=None,
-                face_bbox=None,
-                face_confidence=None,
-            )
-
-        x0, y0, x1, y1 = head_bbox
-        head_w = max(1.0, float(x1 - x0))
-        head_h = max(1.0, float(y1 - y0))
-        cx = (x0 + x1) / 2.0
-        forehead_top = y0 + head_h * float(self.args.thermal_forehead_top_ratio)
-        forehead_bottom = y0 + head_h * float(self.args.thermal_forehead_bottom_ratio)
-        half_w = max(3.0, head_w * float(self.args.thermal_forehead_width_ratio) / 2.0)
-        thermal_poly = np.asarray(
-            [
-                [cx - half_w, forehead_top],
-                [cx + half_w, forehead_top],
-                [cx + half_w * 0.88, forehead_bottom],
-                [cx - half_w * 0.88, forehead_bottom],
-            ],
-            dtype=np.float32,
-        )
-        thermal_poly[:, 0] = np.clip(thermal_poly[:, 0], 0, thermal_shape[1] - 1)
-        thermal_poly[:, 1] = np.clip(thermal_poly[:, 1], 0, thermal_shape[0] - 1)
-
-        return self._measure_forehead_poly(
-            np.zeros((0, 2), dtype=np.float32),
-            thermal_poly,
-            temp_c,
-            False,
-            head_bbox=head_bbox,
-            face_bbox=head_bbox,
-            face_confidence=self._thermal_face_confidence(temp_c, head_bbox),
-        )
-
-    @staticmethod
-    def _bbox_from_poly(poly: np.ndarray, shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
-        h, w = shape[:2]
-        x0 = int(np.clip(np.nanmin(poly[:, 0]), 0, w - 1))
-        y0 = int(np.clip(np.nanmin(poly[:, 1]), 0, h - 1))
-        x1 = int(np.clip(np.nanmax(poly[:, 0]) + 1, x0 + 1, w))
-        y1 = int(np.clip(np.nanmax(poly[:, 1]) + 1, y0 + 1, h))
-        return x0, y0, x1, y1
-
-    def _thermal_face_confidence(self, temp_c: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
-        x0, y0, x1, y1 = bbox
-        roi = temp_c[y0:y1, x0:x1]
-        values = roi[np.isfinite(roi)]
-        if values.size == 0:
-            return 0.0
-        face_min = float(self.args.thermal_face_min_c)
-        face_max = float(self.args.thermal_face_max_c)
-        in_range = float(np.mean((values >= face_min) & (values <= face_max)))
-        mean_c = float(np.nanmean(values))
-        w = max(1.0, float(x1 - x0))
-        h = max(1.0, float(y1 - y0))
-        aspect = w / h
-        aspect_score = max(0.0, 1.0 - abs(aspect - 1.1) / 2.0)
-        temp_score = max(0.0, min(1.0, (mean_c - face_min) / max(1.0, 36.5 - face_min)))
-        score = 0.45 * in_range + 0.35 * aspect_score + 0.20 * temp_score
-        return float(np.clip(score, 0.05, 0.99))
-
-    def _track_head_from_thermal(self, temp_c: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-        candidate = self._detect_head_bbox_from_thermal(temp_c)
-        if candidate is None:
-            self.last_head_bbox = None
-            return None
-
-        x0, y0, x1, y1 = [float(v) for v in candidate]
-        if self.last_head_bbox is not None:
-            lx0, ly0, lx1, ly1 = self.last_head_bbox
-            lc = ((lx0 + lx1) / 2.0, (ly0 + ly1) / 2.0)
-            nc = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
-            max_jump = max(18.0, max(lx1 - lx0, ly1 - ly0) * 0.90)
-            if float(np.hypot(nc[0] - lc[0], nc[1] - lc[1])) <= max_jump:
-                alpha = float(self.args.thermal_head_smooth)
-                alpha = min(0.95, max(0.0, alpha))
-                x0 = lx0 * alpha + x0 * (1.0 - alpha)
-                y0 = ly0 * alpha + y0 * (1.0 - alpha)
-                x1 = lx1 * alpha + x1 * (1.0 - alpha)
-                y1 = ly1 * alpha + y1 * (1.0 - alpha)
-
-        self.last_head_bbox = (x0, y0, x1, y1)
-        h, w = temp_c.shape[:2]
-        ix0 = int(np.clip(round(x0), 0, w - 1))
-        iy0 = int(np.clip(round(y0), 0, h - 1))
-        ix1 = int(np.clip(round(x1), ix0 + 1, w))
-        iy1 = int(np.clip(round(y1), iy0 + 1, h))
-        return ix0, iy0, ix1, iy1
-
-    def _detect_head_bbox_from_thermal(self, temp_c: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-        thermal_shape = temp_c.shape[:2]
-        finite = np.isfinite(temp_c)
-        mask = np.zeros(thermal_shape, dtype=np.uint8)
-        mask[
-            finite
-            & (temp_c >= float(self.args.thermal_face_min_c))
-            & (temp_c <= float(self.args.thermal_face_max_c))
-        ] = 255
-
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
-        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-        best: Optional[Tuple[int, int, int, int]] = None
-        best_score = -1.0
-        min_area = int(self.args.thermal_face_min_area)
-        for idx in range(1, count):
-            area = int(stats[idx, cv2.CC_STAT_AREA])
-            if area < min_area:
-                continue
-            x = int(stats[idx, cv2.CC_STAT_LEFT])
-            y = int(stats[idx, cv2.CC_STAT_TOP])
-            w = int(stats[idx, cv2.CC_STAT_WIDTH])
-            h = int(stats[idx, cv2.CC_STAT_HEIGHT])
-            if w < 8 or h < 10:
-                continue
-
-            values = temp_c[labels == idx]
-            values = values[np.isfinite(values)]
-            if values.size == 0:
-                continue
-
-            component_mask = labels[y : y + h, x : x + w] == idx
-            head_h = int(round(max(
-                float(self.args.thermal_head_min_h),
-                min(float(h), float(h) * float(self.args.thermal_head_height_ratio)),
-            )))
-            head_h = max(8, min(h, head_h))
-            upper = component_mask[:head_h, :]
-            ys, xs = np.where(upper)
-            if xs.size < max(12, min_area // 4):
-                continue
-
-            hx0 = x + int(np.nanmin(xs))
-            hx1 = x + int(np.nanmax(xs)) + 1
-            hy0 = y + int(np.nanmin(ys))
-            hy1 = y + int(np.nanmax(ys)) + 1
-
-            expand_x = max(2, int(round((hx1 - hx0) * 0.08)))
-            expand_y = max(1, int(round((hy1 - hy0) * 0.05)))
-            hx0 = max(0, hx0 - expand_x)
-            hx1 = min(thermal_shape[1], hx1 + expand_x)
-            hy0 = max(0, hy0 - expand_y)
-            hy1 = min(thermal_shape[0], hy1 + expand_y)
-
-            head_w = max(1, hx1 - hx0)
-            head_h_final = max(1, hy1 - hy0)
-            aspect = head_w / max(head_h_final, 1)
-            if aspect < 0.35 or aspect > 3.4:
-                continue
-
-            mean_c = float(np.nanmean(values))
-            top_bonus = 1.0 + (thermal_shape[0] - hy0) / max(thermal_shape[0], 1)
-            compact_bonus = min(area, head_w * head_h_final * 3)
-            score = compact_bonus * top_bonus + mean_c * 6.0
-            if score > best_score:
-                best = (hx0, hy0, hx1, hy1)
-                best_score = score
-
-        return best
-
-    def _measure_forehead_poly(
-        self,
-        rgb_poly: np.ndarray,
-        thermal_poly: np.ndarray,
-        temp_c: np.ndarray,
-        calibrated: bool,
-        head_bbox: Optional[Tuple[int, int, int, int]] = None,
-        face_bbox: Optional[Tuple[int, int, int, int]] = None,
-        face_confidence: Optional[float] = None,
-    ) -> ForeheadMeasurement:
-        thermal_shape = temp_c.shape[:2]
-        mask = np.zeros(thermal_shape, dtype=np.uint8)
-        cv2.fillConvexPoly(mask, np.round(thermal_poly).astype(np.int32), 255)
-        values = temp_c[mask > 0]
-        values = values[np.isfinite(values)]
-        values = values[
-            (values >= float(self.args.forehead_min_c))
-            & (values <= float(self.args.forehead_max_c))
-        ]
-
-        if values.size == 0:
-            measured = None
-            status = "forehead-no-temp"
-        else:
-            measured = float(np.nanpercentile(values, float(self.args.forehead_percentile)))
-            status = "forehead-alert" if measured >= float(self.args.forehead_threshold_c) else "forehead-ok"
-
-        return ForeheadMeasurement(
-            rgb_poly=rgb_poly,
-            thermal_poly=thermal_poly,
-            temp_c=measured,
-            status=status,
-            calibrated=calibrated,
-            head_bbox=head_bbox,
-            face_bbox=face_bbox,
-            face_confidence=face_confidence,
-        )
-
-    def _measure_hot_objects(
-        self,
-        rgb_frame: Optional[np.ndarray],
-        temp_c: np.ndarray,
-        forehead: Optional[ForeheadMeasurement],
-    ) -> List[HotObjectMeasurement]:
-        threshold = float(self.args.hot_threshold_c)
-        mask = np.zeros(temp_c.shape[:2], dtype=np.uint8)
-        mask[np.isfinite(temp_c) & (temp_c >= threshold)] = 255
-
-        if forehead is not None and forehead.thermal_poly.size:
-            cv2.fillConvexPoly(mask, np.round(forehead.thermal_poly).astype(np.int32), 0)
-
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-        spots: List[Dict[str, Any]] = []
-        for idx in range(1, count):
-            area = int(stats[idx, cv2.CC_STAT_AREA])
-            if area < int(self.args.hot_min_area):
-                continue
-            x = int(stats[idx, cv2.CC_STAT_LEFT])
-            y = int(stats[idx, cv2.CC_STAT_TOP])
-            w = int(stats[idx, cv2.CC_STAT_WIDTH])
-            h = int(stats[idx, cv2.CC_STAT_HEIGHT])
-            component_values = temp_c[labels == idx]
-            component_values = component_values[np.isfinite(component_values)]
-            if component_values.size == 0:
-                continue
-            spots.append(
-                {
-                    "bbox": (x, y, x + w, y + h),
-                    "centroid": (float(centroids[idx][0]), float(centroids[idx][1])),
-                    "max_c": float(np.nanmax(component_values)),
-                    "avg_c": float(np.nanmean(component_values)),
-                    "area": area,
-                }
-            )
-
-        spots.sort(key=lambda item: item["max_c"], reverse=True)
-        spots = spots[: max(1, int(self.args.hot_max_alerts))]
-        spots = self.hot_tracker.update(spots, time.time())
-
-        if self.yolo is not None and self.yolo.model is not None and rgb_frame is not None:
-            if self.frame_index % max(1, int(self.args.yolo_every_n)) == 1 or not self.last_yolo_detections:
-                self.last_yolo_detections = self.yolo.detect(rgb_frame, float(self.args.yolo_conf))
-
-        out: List[HotObjectMeasurement] = []
-        for spot in spots:
-            label, conf = (None, None)
-            if rgb_frame is not None:
-                label, conf = self._label_for_hot_spot(spot, rgb_frame.shape[:2], temp_c.shape[:2])
-            risk_label = label is not None and any(token in label.lower() for token in self.risk_classes)
-            no_yolo_label = self.yolo is None or self.yolo.model is None or label is None
-            persistent_s = float(spot.get("persistent_s", 0.0))
-            alert = persistent_s >= float(self.args.hot_persist_s) and (risk_label or no_yolo_label)
-            out.append(
-                HotObjectMeasurement(
-                    bbox=spot["bbox"],
-                    centroid=spot["centroid"],
-                    max_c=float(spot["max_c"]),
-                    avg_c=float(spot["avg_c"]),
-                    area=int(spot["area"]),
-                    persistent_s=persistent_s,
-                    label=label,
-                    confidence=conf,
-                    alert=alert,
-                )
-            )
-        return out
-
-    def _label_for_hot_spot(
-        self,
-        spot: Dict[str, Any],
-        rgb_shape: Tuple[int, int],
-        thermal_shape: Tuple[int, int],
-    ) -> Tuple[Optional[str], Optional[float]]:
-        if not self.last_yolo_detections:
-            return None, None
-
-        cx, cy = spot["centroid"]
-        rgb_pt = self.alignment.map_thermal_to_rgb(
-            np.asarray([[cx, cy]], dtype=np.float32),
-            rgb_shape,
-            thermal_shape,
-        )[0]
-        px, py = float(rgb_pt[0]), float(rgb_pt[1])
-
-        best: Optional[Dict[str, Any]] = None
-        best_area = float("inf")
-        for det in self.last_yolo_detections:
-            x0, y0, x1, y1 = det["bbox"]
-            if x0 <= px <= x1 and y0 <= py <= y1:
-                area = max(1.0, float((x1 - x0) * (y1 - y0)))
-                if area < best_area:
-                    best = det
-                    best_area = area
-
-        if best is None:
-            return None, None
-        return str(best["label"]), float(best["confidence"])
-
-
-def draw_poly_on_heatmap(
-    img: np.ndarray,
-    poly: np.ndarray,
-    thermal_shape: Tuple[int, int],
-    color: Tuple[int, int, int],
-    thickness: int = 2,
-) -> np.ndarray:
-    if poly.size == 0:
-        return np.zeros((0, 2), dtype=np.int32)
-    h, w = img.shape[:2]
-    th, tw = thermal_shape[:2]
-    display_poly = poly.astype(np.float32).copy()
-    display_poly[:, 0] *= w / max(tw, 1)
-    display_poly[:, 1] *= h / max(th, 1)
-    display_poly_i = np.round(display_poly).astype(np.int32)
-    cv2.polylines(img, [display_poly_i], True, (0, 0, 0), thickness + 2, cv2.LINE_AA)
-    cv2.polylines(img, [display_poly_i], True, color, thickness, cv2.LINE_AA)
-    return display_poly_i
-
-
-def draw_ai_overlay(img: np.ndarray, overlay: AIOverlay, thermal_shape: Tuple[int, int], unit: str) -> None:
-    h, w = img.shape[:2]
-
-    if overlay.forehead is not None:
-        color = (0, 0, 255) if overlay.forehead.status == "forehead-alert" else (0, 255, 128)
-        if overlay.forehead.face_bbox is not None:
-            x0, y0, x1, y1 = overlay.forehead.face_bbox
-            face_poly = np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
-            display_face = draw_poly_on_heatmap(img, face_poly, thermal_shape, (0, 0, 255), 2)
-            if display_face.size:
-                fx = int(np.nanmin(display_face[:, 0]))
-                fy = int(np.nanmin(display_face[:, 1]))
-                confidence = overlay.forehead.face_confidence
-                label = "FACE"
-                if confidence is not None:
-                    label += f" {confidence * 100.0:.1f}%"
-                put_text(img, label, (max(8, fx), max(22, fy - 8)), scale=0.50, color=(0, 0, 255))
-        display_poly = draw_poly_on_heatmap(img, overlay.forehead.thermal_poly, thermal_shape, color, 2)
-        if display_poly.size:
-            x = int(np.nanmin(display_poly[:, 0]))
-            y = int(np.nanmin(display_poly[:, 1]))
-            prefix = "Forehead"
-            if not overlay.forehead.calibrated:
-                prefix += " ~"
-            label = f"{prefix}: {fmt_temp(overlay.forehead.temp_c, unit)}"
-            put_text(img, label, (max(8, x), max(22, y - 8)), scale=0.50, color=color)
-        elif overlay.forehead.status in ("no-face", "thermal-no-face", "thermal-no-head"):
-            put_text(img, "AI face: not found", (10, h - 18), scale=0.46, color=(0, 255, 255))
-
-    for item in overlay.hot_objects:
-        x0, y0, x1, y1 = item.bbox
-        poly = np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
-        color = (0, 0, 255) if item.alert else (0, 255, 255)
-        display_poly = draw_poly_on_heatmap(img, poly, thermal_shape, color, 2)
-        if display_poly.size:
-            dx0 = int(np.nanmin(display_poly[:, 0]))
-            dy0 = int(np.nanmin(display_poly[:, 1]))
-            label = "ALERT" if item.alert else "HOT"
-            label += f" {fmt_temp(item.max_c, unit)}"
-            if item.label:
-                label += f" {item.label}"
-            put_text(img, label, (max(8, dx0), max(22, dy0 - 8)), scale=0.46, color=color)
-
-    if overlay.status_lines:
-        y = h - 18
-        for line in reversed(overlay.status_lines[-3:]):
-            put_text(img, line, (10, y), scale=0.38, color=(200, 255, 255))
-            y -= 15
-
-
-def run_ai_calibration(
-    rgb_frame: np.ndarray,
-    thermal_display_source: np.ndarray,
-    output_path: str,
-) -> bool:
-    rgb_h, rgb_w = rgb_frame.shape[:2]
-    th, tw = thermal_display_source.shape[:2]
-    thermal_norm = normalize_linear(
-        thermal_display_source.astype(np.float32),
-        *robust_percentile_range(thermal_display_source.astype(np.float32), 1.0, 99.0),
-    )
-    thermal_color = cv2.applyColorMap(thermal_norm, cv2.COLORMAP_JET)
-    thermal_view = cv2.resize(thermal_color, (rgb_w, rgb_h), interpolation=cv2.INTER_CUBIC)
-    rgb_points: List[Tuple[float, float]] = []
-    thermal_points: List[Tuple[float, float]] = []
-    window = "TC001 AI Calibration"
-
-    def redraw() -> np.ndarray:
-        left = rgb_frame.copy()
-        right = thermal_view.copy()
-        for idx, (x, y) in enumerate(rgb_points):
-            cv2.circle(left, (int(x), int(y)), 6, (0, 255, 0), -1, cv2.LINE_AA)
-            put_text(left, str(idx + 1), (int(x) + 8, int(y) - 8), scale=0.5, color=(0, 255, 0))
-        for idx, (x, y) in enumerate(thermal_points):
-            sx = x * rgb_w / max(tw, 1)
-            sy = y * rgb_h / max(th, 1)
-            cv2.circle(right, (int(sx), int(sy)), 6, (0, 255, 255), -1, cv2.LINE_AA)
-            put_text(right, str(idx + 1), (int(sx) + 8, int(sy) - 8), scale=0.5, color=(0, 255, 255))
-        canvas = np.hstack([left, right])
-        put_text(canvas, "Click 4 RGB points on left, then same 4 thermal points on right", (10, 24), scale=0.55)
-        put_text(canvas, "r reset | q/ESC cancel | saves automatically after 8 clicks", (10, 48), scale=0.48)
-        return canvas
-
-    def on_mouse(event: int, x: int, y: int, _flags: int, _param: Any) -> None:
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-        if len(rgb_points) < 4:
-            if x < rgb_w and y < rgb_h:
-                rgb_points.append((float(x), float(y)))
-        elif len(thermal_points) < 4:
-            if rgb_w <= x < rgb_w * 2 and y < rgb_h:
-                tx = (x - rgb_w) * tw / max(rgb_w, 1)
-                ty = y * th / max(rgb_h, 1)
-                thermal_points.append((float(tx), float(ty)))
-
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window, on_mouse)
-    saved = False
-
-    try:
-        while True:
-            cv2.imshow(window, redraw())
-            key = cv2.waitKey(20) & 0xFF
-            if key in (27, ord("q")):
-                break
-            if key == ord("r"):
-                rgb_points.clear()
-                thermal_points.clear()
-            if len(rgb_points) == 4 and len(thermal_points) == 4:
-                src = np.asarray(rgb_points, dtype=np.float32)
-                dst = np.asarray(thermal_points, dtype=np.float32)
-                matrix = cv2.getPerspectiveTransform(src, dst)
-                data = {
-                    "created_at": timestamp(),
-                    "rgb_size": [rgb_w, rgb_h],
-                    "thermal_size": [tw, th],
-                    "rgb_points": [[float(x), float(y)] for x, y in rgb_points],
-                    "thermal_points": [[float(x), float(y)] for x, y in thermal_points],
-                    "homography": matrix.astype(float).tolist(),
-                }
-                with open(output_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, indent=2)
-                print(f"AI calibration saved: {os.path.abspath(output_path)}")
-                saved = True
-                break
-    finally:
-        cv2.destroyWindow(window)
-
-    return saved
-
 
 def probe_raw_streams(args: argparse.Namespace) -> int:
     print("Scanning for possible TC001 raw/radiometric streams...")
@@ -1457,7 +641,7 @@ def probe_raw_streams(args: argparse.Namespace) -> int:
 
     any_radiometric = False
 
-    for idx in range(max(1, int(args.scan_min)), int(args.scan_max) + 1):
+    for idx in range(args.scan_max + 1):
         for backend_name, _backend_value in backend_candidates(args.backend):
             for label, opt in configs:
                 cap, used_backend = open_camera(
@@ -1603,7 +787,7 @@ def resize_to_window(img: np.ndarray, enabled: bool) -> np.ndarray:
     if h <= 0 or w <= 0:
         return img
     scale = max(win_w / w, win_h / h)
-    interpolation = cv2.INTER_LINEAR if scale > 1.0 else cv2.INTER_AREA
+    interpolation = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
     return cv2.resize(img, (win_w, win_h), interpolation=interpolation)
 
 
@@ -1934,10 +1118,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Live false-color viewer for TOPDON TC001/TC001 Plus thermal camera on Windows."
     )
-    parser.add_argument("-d", "--device", type=int, default=DEFAULT_OPENCV_CAMERA_INDEX, help="OpenCV video device number. Camera 0 is intentionally blocked. Default: 1.")
+    parser.add_argument("-d", "--device", type=int, default=1, help="OpenCV video device number, e.g. 0, 1, 2. Default: 1.")
     parser.add_argument("--list", action="store_true", help="Scan and list readable OpenCV video device indexes.")
     parser.add_argument("--find-raw", action="store_true", help="Scan camera/backend/format combinations for radiometric temperature data.")
-    parser.add_argument("--scan-min", type=int, default=DEFAULT_OPENCV_CAMERA_INDEX, help="Lowest camera index to scan. Camera 0 is intentionally skipped. Default: 1.")
     parser.add_argument("--scan-max", type=int, default=3, help="Highest camera index to scan. Default: 3.")
     parser.add_argument("--backend", choices=["auto", "msmf", "dshow", "any"], default="auto", help="OpenCV backend. Default: auto.")
     parser.add_argument("--width", type=int, default=TC001_WIDTH, help="Raw thermal width. Default: 256.")
@@ -1971,44 +1154,6 @@ def parse_args() -> argparse.Namespace:
         default=r"C:\Program Files\TOPDON\TopView\dll\dll_c001p",
         help="Directory containing TOPDON libiruvc.dll. Default: TopView dll_c001p folder.",
     )
-    parser.add_argument("--ai-forehead", action="store_true", help="Enable face detection on thermal/RGB input, then derive forehead temperature ROI.")
-    parser.add_argument("--ai-rgb-face", action="store_true", help="Use MediaPipe/RGB face detection instead of the default thermal-only face detection.")
-    parser.add_argument("--hot-object-watch", action="store_true", help="Enable thermal hot-object detection and optional YOLO labels.")
-    parser.add_argument("--calibrate-ai", action="store_true", help="Open a 4-point RGB-to-thermal calibration window and save --alignment-file.")
-    parser.add_argument("--alignment-file", default="tc001_alignment.json", help="AI calibration file. Default: tc001_alignment.json.")
-    parser.add_argument("--rgb-device", type=int, default=DEFAULT_OPENCV_CAMERA_INDEX, help="OpenCV RGB/visual camera index for AI. Camera 0 is intentionally blocked. Default: 1.")
-    parser.add_argument("--rgb-backend", choices=["auto", "msmf", "dshow", "any"], default="auto", help="OpenCV backend for AI RGB camera. Default: auto.")
-    parser.add_argument("--rgb-width", type=int, default=640, help="Requested RGB camera width for AI. Default: 640.")
-    parser.add_argument("--rgb-height", type=int, default=480, help="Requested RGB camera height for AI. Default: 480.")
-    parser.add_argument("--rgb-fps", type=int, default=25, help="Requested RGB camera FPS for AI. Default: 25.")
-    parser.add_argument("--ai-every-n", type=int, default=3, help="Run face detection every N frames. Default: 3.")
-    parser.add_argument("--forehead-threshold-c", type=float, default=37.5, help="Forehead alert threshold in Celsius. Default: 37.5.")
-    parser.add_argument("--forehead-percentile", type=float, default=90.0, help="Percentile used inside forehead ROI. Default: 90.")
-    parser.add_argument("--forehead-min-c", type=float, default=20.0, help="Minimum plausible forehead ROI temp. Default: 20.")
-    parser.add_argument("--forehead-max-c", type=float, default=45.0, help="Maximum plausible forehead ROI temp. Default: 45.")
-    parser.add_argument("--no-thermal-forehead-fallback", dest="thermal_forehead_fallback", action="store_false", default=True, help="Disable thermal-only forehead estimate when MediaPipe/RGB is unavailable.")
-    parser.add_argument("--thermal-face-min-c", type=float, default=30.0, help="Thermal-only face lower threshold. Default: 30.")
-    parser.add_argument("--thermal-face-max-c", type=float, default=43.0, help="Thermal-only face upper threshold. Default: 43.")
-    parser.add_argument("--thermal-face-min-area", type=int, default=80, help="Minimum warm connected-component area for thermal forehead fallback. Default: 80.")
-    parser.add_argument("--thermal-head-height-ratio", type=float, default=0.42, help="Upper component ratio used as thermal head candidate. Default: 0.42.")
-    parser.add_argument("--thermal-head-min-h", type=float, default=20.0, help="Minimum thermal head candidate height in pixels. Default: 20.")
-    parser.add_argument("--thermal-head-smooth", type=float, default=0.45, help="Head bbox temporal smoothing amount. Default: 0.45.")
-    parser.add_argument("--thermal-forehead-top-ratio", type=float, default=0.18, help="Thermal fallback forehead top ratio inside detected head area. Default: 0.18.")
-    parser.add_argument("--thermal-forehead-bottom-ratio", type=float, default=0.36, help="Thermal fallback forehead bottom ratio inside detected head area. Default: 0.36.")
-    parser.add_argument("--thermal-forehead-width-ratio", type=float, default=0.34, help="Thermal fallback forehead width ratio inside detected head area. Default: 0.34.")
-    parser.add_argument("--hot-threshold-c", type=float, default=60.0, help="Hot object threshold in Celsius. Default: 60.")
-    parser.add_argument("--hot-min-area", type=int, default=8, help="Minimum thermal pixels for a hot object. Default: 8.")
-    parser.add_argument("--hot-persist-s", type=float, default=2.0, help="Seconds a hot object must persist before alert. Default: 2.")
-    parser.add_argument("--hot-max-alerts", type=int, default=3, help="Maximum hot objects shown per frame. Default: 3.")
-    parser.add_argument("--ai-use-yolo", action="store_true", help="Use Ultralytics YOLO for hot object labels if installed.")
-    parser.add_argument("--ai-object-model", default="yolo11n.pt", help="YOLO model path/name. Default: yolo11n.pt.")
-    parser.add_argument("--yolo-conf", type=float, default=0.35, help="YOLO confidence threshold. Default: 0.35.")
-    parser.add_argument("--yolo-every-n", type=int, default=10, help="Run YOLO every N frames. Default: 10.")
-    parser.add_argument(
-        "--risk-classes",
-        default="socket,outlet,power strip,plug,charger,adapter,battery,laptop,cell phone,tv,oven,microwave,toaster,hair drier",
-        help="Comma-separated YOLO labels treated as fire/electrical risk classes.",
-    )
     return parser.parse_args()
 
 
@@ -2016,22 +1161,13 @@ def main() -> int:
     args = parse_args()
 
     if args.list:
-        list_video_devices(args.scan_min, args.scan_max, args.width, args.height, args.fps, args.backend)
+        list_video_devices(args.scan_max, args.width, args.height, args.fps, args.backend)
         return 0
 
     if args.find_raw:
         return probe_raw_streams(args)
 
     device = args.device
-    ai_requested = bool(args.ai_forehead or args.hot_object_watch or args.calibrate_ai)
-
-    if device == 0:
-        print("ERROR: Camera index 0 is blocked by design. Use --device 1 for TC001 Plus/OpenCV visual mode.")
-        return 2
-    if ai_requested and int(args.rgb_device) == 0:
-        print("ERROR: AI RGB camera index 0 is blocked by design. Use --rgb-device 1.")
-        return 2
-
     if device is None:
         print("No --device was provided.")
         print("Use --list first, then run for example: py tc001_thermal_viewer_v5.py --device 1")
@@ -2045,9 +1181,6 @@ def main() -> int:
             device = int(typed)
         except ValueError:
             print("ERROR: Device number must be an integer such as 0, 1, or 2.")
-            return 2
-        if device == 0:
-            print("ERROR: Camera index 0 is blocked by design. Use camera index 1.")
             return 2
 
     state = ViewerState(
@@ -2075,9 +1208,7 @@ def main() -> int:
     )
 
     cap: Optional[cv2.VideoCapture] = None
-    rgb_cap: Optional[cv2.VideoCapture] = None
     sdk_cam: Optional[TC001SdkCamera] = None
-    ai: Optional[ThermalAI] = None
 
     if args.sdk_raw:
         print("Opening TC001 Plus through TOPDON SDK/libiruvc real radiometric stream...")
@@ -2118,42 +1249,6 @@ def main() -> int:
             return 1
 
         print(f"Opened device {device} with backend={used_backend}.")
-
-    if ai_requested:
-        try:
-            ai = ThermalAI(args)
-            for line in ai.status_lines():
-                print(line)
-        except Exception as exc:
-            print(f"WARNING: AI setup failed: {exc}")
-            ai = None
-            if args.calibrate_ai:
-                return 1
-
-        needs_rgb = bool(args.calibrate_ai or (ai is not None and ai.needs_rgb()))
-        if needs_rgb:
-            if cap is not None and sdk_cam is None and int(args.rgb_device) == int(device):
-                print(f"AI RGB source: reusing video device {device}.")
-            else:
-                print(f"Opening AI RGB source device {args.rgb_device} using backend={args.rgb_backend}...")
-                rgb_cap, rgb_backend = open_camera(
-                    int(args.rgb_device),
-                    int(args.rgb_width),
-                    int(args.rgb_height),
-                    int(args.rgb_fps),
-                    backend=args.rgb_backend,
-                    options=OpenOptions(request_raw=False),
-                )
-                if not rgb_cap.isOpened():
-                    print(f"WARNING: Could not open AI RGB device {args.rgb_device}. AI will use thermal-only features.")
-                    rgb_cap.release()
-                    rgb_cap = None
-                    if args.calibrate_ai:
-                        return 1
-                else:
-                    print(f"Opened AI RGB device {args.rgb_device} with backend={rgb_backend}.")
-        elif ai_requested:
-            print("AI RGB source not opened: using thermal-only forehead/hot-object logic.")
 
     if args.probe:
         if sdk_cam is not None:
@@ -2219,51 +1314,6 @@ def main() -> int:
         print(f"OpenCV error: {exc}")
         return 1
 
-    if args.calibrate_ai:
-        print("Starting 4-point AI calibration...")
-        calibration_rgb: Optional[np.ndarray] = None
-        calibration_thermal: Optional[ThermalFrame] = None
-
-        if rgb_cap is not None:
-            ret_rgb, calibration_rgb = rgb_cap.read()
-            if not ret_rgb:
-                calibration_rgb = None
-        elif cap is not None:
-            ret_rgb, calibration_rgb = cap.read()
-            if not ret_rgb:
-                calibration_rgb = None
-
-        if sdk_cam is not None:
-            temp_c = sdk_cam.read_temp_c(timeout_s=2.0)
-            if temp_c is not None:
-                temp_c = temp_c * args.temp_scale + args.temp_offset
-                calibration_thermal = ThermalFrame(display_source=temp_c, temp_c=temp_c, mode="sdk-radiometric")
-        elif cap is not None:
-            ret_frame, frame_for_cal = cap.read()
-            if ret_frame and frame_for_cal is not None:
-                working_frame = split_frame_if_needed(frame_for_cal, state.split_mode)
-                calibration_thermal = decode_frame(
-                    working_frame,
-                    args.width,
-                    args.height,
-                    args.fallback_min_c,
-                    args.fallback_max_c,
-                    args.estimate_temps,
-                    args.temp_scale,
-                    args.temp_offset,
-                )
-
-        if calibration_rgb is None or calibration_thermal is None:
-            print("ERROR: Calibration needs both an RGB frame and a thermal frame.")
-            return 1
-
-        calibration_thermal = apply_orientation(calibration_thermal, state)
-        if run_ai_calibration(calibration_rgb, calibration_thermal.display_source, args.alignment_file):
-            if ai is not None:
-                ai.alignment = AlignmentMap.load(args.alignment_file)
-        else:
-            print("AI calibration cancelled.")
-
     print_controls()
 
     fps_smooth = 0.0
@@ -2273,7 +1323,6 @@ def main() -> int:
     try:
         while True:
             frame = None
-            rgb_frame_for_ai: Optional[np.ndarray] = None
             if sdk_cam is not None:
                 temp_c = sdk_cam.read_temp_c(timeout_s=1.0)
                 ret = temp_c is not None
@@ -2305,14 +1354,6 @@ def main() -> int:
 
             read_failures = 0
 
-            if ai is not None and (args.ai_forehead or args.hot_object_watch):
-                if rgb_cap is not None:
-                    ret_rgb, rgb_candidate = rgb_cap.read()
-                    if ret_rgb and rgb_candidate is not None:
-                        rgb_frame_for_ai = rgb_candidate
-                elif frame is not None:
-                    rgb_frame_for_ai = frame
-
             if sdk_cam is not None and temp_c is not None:
                 temp_c = temp_c * args.temp_scale + args.temp_offset
                 thermal = ThermalFrame(display_source=temp_c, temp_c=temp_c, mode="sdk-radiometric")
@@ -2333,9 +1374,6 @@ def main() -> int:
             heatmap, contrast_range = make_heatmap(thermal.display_source, state)
             heatmap = resize_to_window(heatmap, state.fit_window)
             draw_hud(heatmap, thermal, state, fps_smooth, contrast_range, recorder)
-            if ai is not None and (args.ai_forehead or args.hot_object_watch):
-                ai_overlay = ai.analyze(rgb_frame_for_ai, thermal.temp_c)
-                draw_ai_overlay(heatmap, ai_overlay, thermal.display_source.shape[:2], state.unit)
 
             if state.recording and recorder.writer is not None:
                 out = heatmap
@@ -2357,8 +1395,6 @@ def main() -> int:
             stop_recording(recorder)
         if cap is not None:
             cap.release()
-        if rgb_cap is not None:
-            rgb_cap.release()
         if sdk_cam is not None:
             sdk_cam.close()
         cv2.destroyAllWindows()

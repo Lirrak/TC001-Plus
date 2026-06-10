@@ -60,133 +60,12 @@ py .\tc001_thermal_viewer_v5.py --sdk-raw
 
 Lenh nay la che do nen dung khi can do nhiet do that.
 
-Project nay co chu y khong mo camera index `0`. Tat ca OpenCV visual/RGB va AI
-mac dinh dung camera index `1`. Neu truyen `--device 0` hoac `--rgb-device 0`,
-chuong trinh se dung ngay de tranh mo webcam tich hop.
-
-## AI do tran va canh bao vat nong
-
-AI chay theo kien truc 2 luong:
-
-- `--sdk-raw` doc ma tran nhiet that tu TC001 Plus.
-- `--rgb-device 1` doc anh RGB/visual de AI detect mat nguoi va vat the.
-
-### 1. Calibration 4 diem
-
-Chay mot lan de can khop anh RGB voi anh nhiet:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --calibrate-ai --rgb-device 1
-```
-
-Trong cua so calibration:
-
-1. Bam 4 diem de nhan ra tren anh RGB ben trai.
-2. Bam dung 4 diem tuong ung tren anh nhiet ben phai.
-3. Chuong trinh tu luu `tc001_alignment.json` sau khi du 8 click.
-
-Nen dung cac diem co hinh dang ro, vi du 4 goc cua mot hop, to giay, man hinh
-hoac vat the co canh ro. Neu thay doi vi tri/goc lap camera, hay calibration lai.
-
-### 2. Do nhiet do tran
-
-Che do nhe nhat, khong can MediaPipe/RGB. Pipeline se detect khung mat tren anh
-nhiet truoc (`FACE xx%`), sau do moi suy ra vung `Forehead` ben trong khung do:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead
-```
-
-Day la che do nen thu truoc neu may bi lag hoac chua cai `mediapipe`. Tren cua
-so viewer, hay nhin khung do `FACE xx%` truoc. Neu khung mat dung vi tri dau/mat
-nguoi thi moi tiep tuc tinh chinh vung `Forehead`.
-
-Neu muon dung MediaPipe tren RGB/cam1 de detect mat thay vi thermal-only:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --ai-rgb-face --rgb-device 1
-```
-
-Viewer se detect mat tren RGB, lay vung tran, map sang ma tran nhiet va hien:
-
-```text
-Forehead: 36.x degC
-```
-
-Nguong canh bao mac dinh la `37.5C`, co the doi:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --forehead-threshold-c 37.8
-```
-
-Neu vung tran thermal-only bi lech, co the tinh chinh ROI:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --thermal-forehead-top-ratio 0.14 --thermal-forehead-bottom-ratio 0.32
-```
-
-Neu khung `FACE` qua cao/thap hoac dinh ca vai/than, thu chinh phan thermal head
-tracker:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --thermal-head-height-ratio 0.34
-```
-
-Neu khung `FACE` bi giat, tang smoothing:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --thermal-head-smooth 0.65
-```
-
-Ket qua nay chi la ho tro giam sat, khong phai thiet bi chan doan y te.
-
-### 3. Canh bao vat nong
-
-Bat rule thermal phat hien vat nong:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --hot-object-watch --rgb-device 1
-```
-
-Mac dinh vat nong la vung vuot `60C`, ton tai it nhat `2s`, va co dien tich tu
-`8` pixel nhiet tro len. Co the chinh:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --hot-object-watch --hot-threshold-c 55 --hot-persist-s 3
-```
-
-### 4. Chay ca do tran va vat nong
-
-Che do nhe, khong YOLO:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --hot-object-watch
-```
-
-Che do dung RGB/cam1:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --hot-object-watch --rgb-device 1
-```
-
-### 5. YOLO label cho vat nguy hiem
-
-Neu cai `ultralytics`, co the bat YOLO de gan nhan vat the gan hotspot:
-
-```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --hot-object-watch --rgb-device 1 --ai-use-yolo --ai-object-model yolo11n.pt
-```
-
-Luu y: model pretrained co the nhan duoc mot so lop pho bien nhu `laptop`,
-`cell phone`, `tv`, nhung cac lop nhu `socket`, `outlet`, `adapter`, `power
-strip` thuong can train/fine-tune model rieng de chinh xac.
-
 ## Cac lenh debug huu ich
 
 Liet ke camera OpenCV:
 
 ```powershell
-py .\tc001_thermal_viewer_v5.py --list --scan-min 1
+py .\tc001_thermal_viewer_v5.py --list
 ```
 
 Mo camera OpenCV index 1 de xem visual stream:
@@ -198,7 +77,7 @@ py .\tc001_thermal_viewer_v5.py --device 1
 Thu scan raw/radiometric qua OpenCV:
 
 ```powershell
-py .\tc001_thermal_viewer_v5.py --find-raw --scan-min 1 --scan-max 5
+py .\tc001_thermal_viewer_v5.py --find-raw --scan-max 5
 ```
 
 Che do estimate tu visual frame, chi de tham khao:
@@ -261,17 +140,19 @@ captures/                        Anh/raw frame mau de debug
 downloads/                       File tai ve phuc vu nghien cuu
 ```
 
-## Ghi chu ve kien truc AI
+## Huong phat trien AI tiep theo
 
-Phan AI hien tai tach thanh hai luong:
+Huong thiet ke du kien la tach thanh hai luong:
 
 - TC001 Plus SDK doc ma tran nhiet that `256x192`.
 - OpenCV `cam1` doc RGB/visual stream cho AI detect.
 
-AI dang dung/ho tro:
+AI co the dung:
 
-- MediaPipe Face Mesh de detect mat va uoc luong vung tran.
-- Ultralytics YOLO optional de gan nhan vat the gan hotspot.
+- MediaPipe Face Landmarker de detect mat va vung tran.
+- YOLO11n/YOLO11s de detect vat the co rui ro nhu o dien, adapter, day dien,
+  pin, o cam keo dai.
 
 Vung detect tren RGB can duoc map sang ma tran nhiet bang calibration 4 diem thu
 cong, de lay nhiet do that tu TC001 Plus thay vi do tu anh mau.
+
