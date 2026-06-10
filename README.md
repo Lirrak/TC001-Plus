@@ -90,6 +90,17 @@ hoac vat the co canh ro. Neu thay doi vi tri/goc lap camera, hay calibration lai
 
 ### 2. Do nhiet do tran
 
+Che do nhe nhat, khong can MediaPipe/RGB, uoc luong vung tran truc tiep tren
+ma tran nhiet:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead
+```
+
+Day la che do nen thu truoc neu may bi lag hoac chua cai `mediapipe`.
+
+Neu muon dung MediaPipe tren RGB/cam1 de detect mat:
+
 ```powershell
 py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --rgb-device 1
 ```
@@ -104,6 +115,12 @@ Nguong canh bao mac dinh la `37.5C`, co the doi:
 
 ```powershell
 py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --rgb-device 1 --forehead-threshold-c 37.8
+```
+
+Neu vung tran thermal-only bi lech, co the tinh chinh ROI:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --thermal-forehead-top-ratio 0.14 --thermal-forehead-bottom-ratio 0.32
 ```
 
 Ket qua nay chi la ho tro giam sat, khong phai thiet bi chan doan y te.
@@ -124,6 +141,14 @@ py .\tc001_thermal_viewer_v5.py --sdk-raw --hot-object-watch --hot-threshold-c 5
 ```
 
 ### 4. Chay ca do tran va vat nong
+
+Che do nhe, khong YOLO:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --hot-object-watch
+```
+
+Che do dung RGB/cam1:
 
 ```powershell
 py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --hot-object-watch --rgb-device 1
