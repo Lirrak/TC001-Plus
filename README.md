@@ -1,0 +1,158 @@
+# TC001 Plus Thermal Viewer
+
+Viewer Python cho TOPDON TC001 / TC001 Plus trên Windows. Mục tiêu chính của
+project là đọc luồng radiometric thật từ TC001 Plus thông qua TOPDON SDK /
+`libiruvc.dll`, sau đó hiển thị heatmap kèm nhiệt độ thật theo don vi Celsius.
+
+> Luu y: cac che do OpenCV visual hoac `--estimate-temps` chi dung de xem anh
+> mau/kiem tra camera. Nhiet do trong cac che do do khong phai du lieu do that
+> tu TC001 Plus.
+
+## Tinh nang hien co
+
+- Mo cua so live viewer cho TC001 / TC001 Plus.
+- Doc nhiet do that bang TOPDON SDK voi `--sdk-raw`.
+- Hien thi average, center, min/max, hot/cold point va threshold.
+- Ho tro color map, contrast, blur, zoom, rotate, flip, fullscreen.
+- Co che do scan/list camera OpenCV de debug.
+- Co snapshot, recording va cac probe/debug scripts trong `tools/`.
+
+## Yeu cau
+
+- Windows.
+- Python 3.10+.
+- TOPDON TopView da cai dat, mac dinh can thu muc:
+
+```text
+C:\Program Files\TOPDON\TopView\dll\dll_c001p
+```
+
+- TC001 Plus da cam vao may va khong bi ung dung khac giu camera.
+
+## Cai dat
+
+Tao virtual environment:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Cai dependency Python:
+
+```powershell
+py -m pip install -r requirements.txt
+```
+
+Neu khong dung `requirements.txt`, co the cai truc tiep:
+
+```powershell
+py -m pip install opencv-python numpy
+```
+
+## Lenh chay chinh
+
+Mo viewer voi nhiet do that tu TC001 Plus:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw
+```
+
+Lenh nay la che do nen dung khi can do nhiet do that.
+
+## Cac lenh debug huu ich
+
+Liet ke camera OpenCV:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --list
+```
+
+Mo camera OpenCV index 1 de xem visual stream:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --device 1
+```
+
+Thu scan raw/radiometric qua OpenCV:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --find-raw --scan-max 5
+```
+
+Che do estimate tu visual frame, chi de tham khao:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --device 1 --estimate-temps --fallback-min-c 22 --fallback-max-c 45
+```
+
+## Dieu khien trong cua so viewer
+
+- `q`: thoat.
+- `c`: doi color map.
+- `+` / `-`: tang/giam contrast.
+- `z` / `x`: zoom in/out.
+- `a`: fit heatmap vao cua so.
+- `f`: fullscreen.
+- `h`: bat/tat HUD.
+- `l`: bat/tat label.
+- `r`: record video.
+- `s`: snapshot.
+- `t` / `g`: tang/giam threshold.
+- `u`: doi Celsius/Fahrenheit.
+- `i`: invert mau.
+- `?`: hien help overlay.
+
+## Xu ly loi thuong gap
+
+### `uvc_camera_stream_start failed: -11`
+
+Thu cac buoc sau:
+
+1. Dong TopView, Windows Camera, OBS, Teams, browser va cac ung dung co the dang
+   giu camera.
+2. Rut TC001 Plus ra va cam lai.
+3. Chay lai:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw
+```
+
+Neu loi van con, khoi dong lai may hoac dung probe trong `tools/probes/` de
+kiem tra thiet bi USB.
+
+### Cua so hien `visual-estimate`
+
+Day khong phai nhiet do that. Hay chay:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw
+```
+
+## Cau truc thu muc
+
+```text
+tc001_thermal_viewer_v5.py       Main viewer hien tai
+tools/probes/                    Script probe SDK/libusb/TopView
+tools/experiments/               Script thu nghiem raw frame
+archive/legacy_viewers/          Cac ban viewer cu
+captures/                        Anh/raw frame mau de debug
+downloads/                       File tai ve phuc vu nghien cuu
+```
+
+## Huong phat trien AI tiep theo
+
+Huong thiet ke du kien la tach thanh hai luong:
+
+- TC001 Plus SDK doc ma tran nhiet that `256x192`.
+- OpenCV `cam1` doc RGB/visual stream cho AI detect.
+
+AI co the dung:
+
+- MediaPipe Face Landmarker de detect mat va vung tran.
+- YOLO11n/YOLO11s de detect vat the co rui ro nhu o dien, adapter, day dien,
+  pin, o cam keo dai.
+
+Vung detect tren RGB can duoc map sang ma tran nhiet bang calibration 4 diem thu
+cong, de lay nhiet do that tu TC001 Plus thay vi do tu anh mau.
+
