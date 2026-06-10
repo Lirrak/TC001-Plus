@@ -12,6 +12,8 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.ultralytics/
+Ultralytics/
 
 *.avi
 *.mp4
@@ -19,4 +21,3 @@ dist/
 
 .env
 .env.*
-
