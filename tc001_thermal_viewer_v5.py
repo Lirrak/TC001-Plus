@@ -636,6 +636,8 @@ class ForeheadMeasurement:
     status: str
     calibrated: bool
     head_bbox: Optional[Tuple[int, int, int, int]] = None
+    face_bbox: Optional[Tuple[int, int, int, int]] = None
+    face_confidence: Optional[float] = None
 
 
 @dataclass
@@ -895,7 +897,7 @@ class ThermalAI:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.alignment = AlignmentMap.load(args.alignment_file)
-        self.face = FaceForeheadDetector() if args.ai_forehead else None
+        self.face = FaceForeheadDetector() if args.ai_forehead and args.ai_rgb_face else None
         self.yolo = YoloObjectDetector(args.ai_object_model, args.hot_object_watch and args.ai_use_yolo)
         self.hot_tracker = HotSpotTracker()
         self.frame_index = 0
@@ -924,7 +926,7 @@ class ThermalAI:
                 lines.append("AI align: rough scale only; run --calibrate-ai")
         if self.face is not None and self.face.error:
             if self.args.thermal_forehead_fallback:
-                lines.append("MediaPipe unavailable; using thermal forehead estimate")
+                lines.append("MediaPipe unavailable; using thermal face detection")
             else:
                 lines.append(self.face.error)
         if self.yolo is not None and self.yolo.error:
@@ -960,11 +962,15 @@ class ThermalAI:
                 )
 
             thermal_poly = self.alignment.map_rgb_to_thermal(self.last_forehead_poly, rgb_shape, thermal_shape)
+            face_bbox = self._bbox_from_poly(thermal_poly, thermal_shape)
             return self._measure_forehead_poly(
                 self.last_forehead_poly.copy(),
                 thermal_poly,
                 temp_c,
                 self.alignment.calibrated,
+                head_bbox=face_bbox,
+                face_bbox=face_bbox,
+                face_confidence=0.95,
             )
 
         if self.args.thermal_forehead_fallback:
@@ -983,6 +989,8 @@ class ThermalAI:
                 status="thermal-no-head",
                 calibrated=False,
                 head_bbox=None,
+                face_bbox=None,
+                face_confidence=None,
             )
 
         x0, y0, x1, y1 = head_bbox
@@ -1010,7 +1018,36 @@ class ThermalAI:
             temp_c,
             False,
             head_bbox=head_bbox,
+            face_bbox=head_bbox,
+            face_confidence=self._thermal_face_confidence(temp_c, head_bbox),
         )
+
+    @staticmethod
+    def _bbox_from_poly(poly: np.ndarray, shape: Tuple[int, int]) -> Tuple[int, int, int, int]:
+        h, w = shape[:2]
+        x0 = int(np.clip(np.nanmin(poly[:, 0]), 0, w - 1))
+        y0 = int(np.clip(np.nanmin(poly[:, 1]), 0, h - 1))
+        x1 = int(np.clip(np.nanmax(poly[:, 0]) + 1, x0 + 1, w))
+        y1 = int(np.clip(np.nanmax(poly[:, 1]) + 1, y0 + 1, h))
+        return x0, y0, x1, y1
+
+    def _thermal_face_confidence(self, temp_c: np.ndarray, bbox: Tuple[int, int, int, int]) -> float:
+        x0, y0, x1, y1 = bbox
+        roi = temp_c[y0:y1, x0:x1]
+        values = roi[np.isfinite(roi)]
+        if values.size == 0:
+            return 0.0
+        face_min = float(self.args.thermal_face_min_c)
+        face_max = float(self.args.thermal_face_max_c)
+        in_range = float(np.mean((values >= face_min) & (values <= face_max)))
+        mean_c = float(np.nanmean(values))
+        w = max(1.0, float(x1 - x0))
+        h = max(1.0, float(y1 - y0))
+        aspect = w / h
+        aspect_score = max(0.0, 1.0 - abs(aspect - 1.1) / 2.0)
+        temp_score = max(0.0, min(1.0, (mean_c - face_min) / max(1.0, 36.5 - face_min)))
+        score = 0.45 * in_range + 0.35 * aspect_score + 0.20 * temp_score
+        return float(np.clip(score, 0.05, 0.99))
 
     def _track_head_from_thermal(self, temp_c: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         candidate = self._detect_head_bbox_from_thermal(temp_c)
@@ -1119,6 +1156,8 @@ class ThermalAI:
         temp_c: np.ndarray,
         calibrated: bool,
         head_bbox: Optional[Tuple[int, int, int, int]] = None,
+        face_bbox: Optional[Tuple[int, int, int, int]] = None,
+        face_confidence: Optional[float] = None,
     ) -> ForeheadMeasurement:
         thermal_shape = temp_c.shape[:2]
         mask = np.zeros(thermal_shape, dtype=np.uint8)
@@ -1144,6 +1183,8 @@ class ThermalAI:
             status=status,
             calibrated=calibrated,
             head_bbox=head_bbox,
+            face_bbox=face_bbox,
+            face_confidence=face_confidence,
         )
 
     def _measure_hot_objects(
@@ -1275,14 +1316,18 @@ def draw_ai_overlay(img: np.ndarray, overlay: AIOverlay, thermal_shape: Tuple[in
 
     if overlay.forehead is not None:
         color = (0, 0, 255) if overlay.forehead.status == "forehead-alert" else (0, 255, 128)
-        if overlay.forehead.head_bbox is not None:
-            x0, y0, x1, y1 = overlay.forehead.head_bbox
-            head_poly = np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
-            display_head = draw_poly_on_heatmap(img, head_poly, thermal_shape, (255, 255, 255), 2)
-            if display_head.size:
-                hx = int(np.nanmin(display_head[:, 0]))
-                hy = int(np.nanmin(display_head[:, 1]))
-                put_text(img, "HEAD", (max(8, hx), max(22, hy - 8)), scale=0.46, color=(255, 255, 255))
+        if overlay.forehead.face_bbox is not None:
+            x0, y0, x1, y1 = overlay.forehead.face_bbox
+            face_poly = np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+            display_face = draw_poly_on_heatmap(img, face_poly, thermal_shape, (0, 0, 255), 2)
+            if display_face.size:
+                fx = int(np.nanmin(display_face[:, 0]))
+                fy = int(np.nanmin(display_face[:, 1]))
+                confidence = overlay.forehead.face_confidence
+                label = "FACE"
+                if confidence is not None:
+                    label += f" {confidence * 100.0:.1f}%"
+                put_text(img, label, (max(8, fx), max(22, fy - 8)), scale=0.50, color=(0, 0, 255))
         display_poly = draw_poly_on_heatmap(img, overlay.forehead.thermal_poly, thermal_shape, color, 2)
         if display_poly.size:
             x = int(np.nanmin(display_poly[:, 0]))
@@ -1293,7 +1338,7 @@ def draw_ai_overlay(img: np.ndarray, overlay: AIOverlay, thermal_shape: Tuple[in
             label = f"{prefix}: {fmt_temp(overlay.forehead.temp_c, unit)}"
             put_text(img, label, (max(8, x), max(22, y - 8)), scale=0.50, color=color)
         elif overlay.forehead.status in ("no-face", "thermal-no-face", "thermal-no-head"):
-            put_text(img, "AI head: not found", (10, h - 18), scale=0.46, color=(0, 255, 255))
+            put_text(img, "AI face: not found", (10, h - 18), scale=0.46, color=(0, 255, 255))
 
     for item in overlay.hot_objects:
         x0, y0, x1, y1 = item.bbox
@@ -1926,7 +1971,8 @@ def parse_args() -> argparse.Namespace:
         default=r"C:\Program Files\TOPDON\TopView\dll\dll_c001p",
         help="Directory containing TOPDON libiruvc.dll. Default: TopView dll_c001p folder.",
     )
-    parser.add_argument("--ai-forehead", action="store_true", help="Enable RGB AI face detection and forehead temperature ROI.")
+    parser.add_argument("--ai-forehead", action="store_true", help="Enable face detection on thermal/RGB input, then derive forehead temperature ROI.")
+    parser.add_argument("--ai-rgb-face", action="store_true", help="Use MediaPipe/RGB face detection instead of the default thermal-only face detection.")
     parser.add_argument("--hot-object-watch", action="store_true", help="Enable thermal hot-object detection and optional YOLO labels.")
     parser.add_argument("--calibrate-ai", action="store_true", help="Open a 4-point RGB-to-thermal calibration window and save --alignment-file.")
     parser.add_argument("--alignment-file", default="tc001_alignment.json", help="AI calibration file. Default: tc001_alignment.json.")
