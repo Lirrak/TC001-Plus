@@ -91,13 +91,16 @@ hoac vat the co canh ro. Neu thay doi vi tri/goc lap camera, hay calibration lai
 ### 2. Do nhiet do tran
 
 Che do nhe nhat, khong can MediaPipe/RGB, uoc luong vung tran truc tiep tren
-ma tran nhiet:
+ma tran nhiet. Pipeline hien tai se track `HEAD` truoc, sau do moi suy ra vung
+`Forehead` ben trong khung dau:
 
 ```powershell
 py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead
 ```
 
-Day la che do nen thu truoc neu may bi lag hoac chua cai `mediapipe`.
+Day la che do nen thu truoc neu may bi lag hoac chua cai `mediapipe`. Tren cua
+so viewer, hay nhin khung trang `HEAD` truoc. Neu `HEAD` dung vi tri dau nguoi
+thi moi tiep tuc tinh chinh vung `Forehead`.
 
 Neu muon dung MediaPipe tren RGB/cam1 de detect mat:
 
@@ -121,6 +124,18 @@ Neu vung tran thermal-only bi lech, co the tinh chinh ROI:
 
 ```powershell
 py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --thermal-forehead-top-ratio 0.14 --thermal-forehead-bottom-ratio 0.32
+```
+
+Neu khung `HEAD` qua cao/thap hoac dinh ca vai/than, thu chinh phan head tracker:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --thermal-head-height-ratio 0.34
+```
+
+Neu khung `HEAD` bi giat, tang smoothing:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --ai-forehead --thermal-head-smooth 0.65
 ```
 
 Ket qua nay chi la ho tro giam sat, khong phai thiet bi chan doan y te.

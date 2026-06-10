@@ -635,6 +635,7 @@ class ForeheadMeasurement:
     temp_c: Optional[float]
     status: str
     calibrated: bool
+    head_bbox: Optional[Tuple[int, int, int, int]] = None
 
 
 @dataclass
@@ -899,6 +900,7 @@ class ThermalAI:
         self.hot_tracker = HotSpotTracker()
         self.frame_index = 0
         self.last_forehead_poly: Optional[np.ndarray] = None
+        self.last_head_bbox: Optional[Tuple[float, float, float, float]] = None
         self.last_yolo_detections: List[Dict[str, Any]] = []
         self.risk_classes = [
             item.strip().lower()
@@ -972,61 +974,24 @@ class ThermalAI:
 
     def _measure_forehead_from_thermal(self, temp_c: np.ndarray) -> ForeheadMeasurement:
         thermal_shape = temp_c.shape[:2]
-        finite = np.isfinite(temp_c)
-        mask = np.zeros(thermal_shape, dtype=np.uint8)
-        mask[
-            finite
-            & (temp_c >= float(self.args.thermal_face_min_c))
-            & (temp_c <= float(self.args.thermal_face_max_c))
-        ] = 255
-
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
-        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
-        best_idx = -1
-        best_score = -1.0
-        min_area = int(self.args.thermal_face_min_area)
-        for idx in range(1, count):
-            area = int(stats[idx, cv2.CC_STAT_AREA])
-            if area < min_area:
-                continue
-            x = int(stats[idx, cv2.CC_STAT_LEFT])
-            y = int(stats[idx, cv2.CC_STAT_TOP])
-            w = int(stats[idx, cv2.CC_STAT_WIDTH])
-            h = int(stats[idx, cv2.CC_STAT_HEIGHT])
-            if w < 8 or h < 8:
-                continue
-            values = temp_c[labels == idx]
-            values = values[np.isfinite(values)]
-            if values.size == 0:
-                continue
-            mean_c = float(np.nanmean(values))
-            top_bonus = 1.0 + (thermal_shape[0] - y) / max(thermal_shape[0], 1)
-            score = area * top_bonus + mean_c * 4.0
-            if score > best_score:
-                best_idx = idx
-                best_score = score
-
-        if best_idx < 0:
+        head_bbox = self._track_head_from_thermal(temp_c)
+        if head_bbox is None:
             return ForeheadMeasurement(
                 rgb_poly=np.zeros((0, 2), dtype=np.float32),
                 thermal_poly=np.zeros((0, 2), dtype=np.float32),
                 temp_c=None,
-                status="thermal-no-face",
+                status="thermal-no-head",
                 calibrated=False,
+                head_bbox=None,
             )
 
-        x = int(stats[best_idx, cv2.CC_STAT_LEFT])
-        y = int(stats[best_idx, cv2.CC_STAT_TOP])
-        w = int(stats[best_idx, cv2.CC_STAT_WIDTH])
-        h = int(stats[best_idx, cv2.CC_STAT_HEIGHT])
-
-        head_h = max(10.0, min(float(h), float(w) * 0.90))
-        cx = x + w / 2.0
-        forehead_top = y + head_h * float(self.args.thermal_forehead_top_ratio)
-        forehead_bottom = y + head_h * float(self.args.thermal_forehead_bottom_ratio)
-        half_w = max(4.0, w * float(self.args.thermal_forehead_width_ratio) / 2.0)
+        x0, y0, x1, y1 = head_bbox
+        head_w = max(1.0, float(x1 - x0))
+        head_h = max(1.0, float(y1 - y0))
+        cx = (x0 + x1) / 2.0
+        forehead_top = y0 + head_h * float(self.args.thermal_forehead_top_ratio)
+        forehead_bottom = y0 + head_h * float(self.args.thermal_forehead_bottom_ratio)
+        half_w = max(3.0, head_w * float(self.args.thermal_forehead_width_ratio) / 2.0)
         thermal_poly = np.asarray(
             [
                 [cx - half_w, forehead_top],
@@ -1044,7 +1009,108 @@ class ThermalAI:
             thermal_poly,
             temp_c,
             False,
+            head_bbox=head_bbox,
         )
+
+    def _track_head_from_thermal(self, temp_c: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        candidate = self._detect_head_bbox_from_thermal(temp_c)
+        if candidate is None:
+            self.last_head_bbox = None
+            return None
+
+        x0, y0, x1, y1 = [float(v) for v in candidate]
+        if self.last_head_bbox is not None:
+            lx0, ly0, lx1, ly1 = self.last_head_bbox
+            lc = ((lx0 + lx1) / 2.0, (ly0 + ly1) / 2.0)
+            nc = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+            max_jump = max(18.0, max(lx1 - lx0, ly1 - ly0) * 0.90)
+            if float(np.hypot(nc[0] - lc[0], nc[1] - lc[1])) <= max_jump:
+                alpha = float(self.args.thermal_head_smooth)
+                alpha = min(0.95, max(0.0, alpha))
+                x0 = lx0 * alpha + x0 * (1.0 - alpha)
+                y0 = ly0 * alpha + y0 * (1.0 - alpha)
+                x1 = lx1 * alpha + x1 * (1.0 - alpha)
+                y1 = ly1 * alpha + y1 * (1.0 - alpha)
+
+        self.last_head_bbox = (x0, y0, x1, y1)
+        h, w = temp_c.shape[:2]
+        ix0 = int(np.clip(round(x0), 0, w - 1))
+        iy0 = int(np.clip(round(y0), 0, h - 1))
+        ix1 = int(np.clip(round(x1), ix0 + 1, w))
+        iy1 = int(np.clip(round(y1), iy0 + 1, h))
+        return ix0, iy0, ix1, iy1
+
+    def _detect_head_bbox_from_thermal(self, temp_c: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+        thermal_shape = temp_c.shape[:2]
+        finite = np.isfinite(temp_c)
+        mask = np.zeros(thermal_shape, dtype=np.uint8)
+        mask[
+            finite
+            & (temp_c >= float(self.args.thermal_face_min_c))
+            & (temp_c <= float(self.args.thermal_face_max_c))
+        ] = 255
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), dtype=np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+        best: Optional[Tuple[int, int, int, int]] = None
+        best_score = -1.0
+        min_area = int(self.args.thermal_face_min_area)
+        for idx in range(1, count):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            x = int(stats[idx, cv2.CC_STAT_LEFT])
+            y = int(stats[idx, cv2.CC_STAT_TOP])
+            w = int(stats[idx, cv2.CC_STAT_WIDTH])
+            h = int(stats[idx, cv2.CC_STAT_HEIGHT])
+            if w < 8 or h < 10:
+                continue
+
+            values = temp_c[labels == idx]
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                continue
+
+            component_mask = labels[y : y + h, x : x + w] == idx
+            head_h = int(round(max(
+                float(self.args.thermal_head_min_h),
+                min(float(h), float(h) * float(self.args.thermal_head_height_ratio)),
+            )))
+            head_h = max(8, min(h, head_h))
+            upper = component_mask[:head_h, :]
+            ys, xs = np.where(upper)
+            if xs.size < max(12, min_area // 4):
+                continue
+
+            hx0 = x + int(np.nanmin(xs))
+            hx1 = x + int(np.nanmax(xs)) + 1
+            hy0 = y + int(np.nanmin(ys))
+            hy1 = y + int(np.nanmax(ys)) + 1
+
+            expand_x = max(2, int(round((hx1 - hx0) * 0.08)))
+            expand_y = max(1, int(round((hy1 - hy0) * 0.05)))
+            hx0 = max(0, hx0 - expand_x)
+            hx1 = min(thermal_shape[1], hx1 + expand_x)
+            hy0 = max(0, hy0 - expand_y)
+            hy1 = min(thermal_shape[0], hy1 + expand_y)
+
+            head_w = max(1, hx1 - hx0)
+            head_h_final = max(1, hy1 - hy0)
+            aspect = head_w / max(head_h_final, 1)
+            if aspect < 0.35 or aspect > 3.4:
+                continue
+
+            mean_c = float(np.nanmean(values))
+            top_bonus = 1.0 + (thermal_shape[0] - hy0) / max(thermal_shape[0], 1)
+            compact_bonus = min(area, head_w * head_h_final * 3)
+            score = compact_bonus * top_bonus + mean_c * 6.0
+            if score > best_score:
+                best = (hx0, hy0, hx1, hy1)
+                best_score = score
+
+        return best
 
     def _measure_forehead_poly(
         self,
@@ -1052,6 +1118,7 @@ class ThermalAI:
         thermal_poly: np.ndarray,
         temp_c: np.ndarray,
         calibrated: bool,
+        head_bbox: Optional[Tuple[int, int, int, int]] = None,
     ) -> ForeheadMeasurement:
         thermal_shape = temp_c.shape[:2]
         mask = np.zeros(thermal_shape, dtype=np.uint8)
@@ -1076,6 +1143,7 @@ class ThermalAI:
             temp_c=measured,
             status=status,
             calibrated=calibrated,
+            head_bbox=head_bbox,
         )
 
     def _measure_hot_objects(
@@ -1207,6 +1275,14 @@ def draw_ai_overlay(img: np.ndarray, overlay: AIOverlay, thermal_shape: Tuple[in
 
     if overlay.forehead is not None:
         color = (0, 0, 255) if overlay.forehead.status == "forehead-alert" else (0, 255, 128)
+        if overlay.forehead.head_bbox is not None:
+            x0, y0, x1, y1 = overlay.forehead.head_bbox
+            head_poly = np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+            display_head = draw_poly_on_heatmap(img, head_poly, thermal_shape, (255, 255, 255), 2)
+            if display_head.size:
+                hx = int(np.nanmin(display_head[:, 0]))
+                hy = int(np.nanmin(display_head[:, 1]))
+                put_text(img, "HEAD", (max(8, hx), max(22, hy - 8)), scale=0.46, color=(255, 255, 255))
         display_poly = draw_poly_on_heatmap(img, overlay.forehead.thermal_poly, thermal_shape, color, 2)
         if display_poly.size:
             x = int(np.nanmin(display_poly[:, 0]))
@@ -1216,8 +1292,8 @@ def draw_ai_overlay(img: np.ndarray, overlay: AIOverlay, thermal_shape: Tuple[in
                 prefix += " ~"
             label = f"{prefix}: {fmt_temp(overlay.forehead.temp_c, unit)}"
             put_text(img, label, (max(8, x), max(22, y - 8)), scale=0.50, color=color)
-        elif overlay.forehead.status in ("no-face", "thermal-no-face"):
-            put_text(img, "AI forehead: no thermal face", (10, h - 18), scale=0.46, color=(0, 255, 255))
+        elif overlay.forehead.status in ("no-face", "thermal-no-face", "thermal-no-head"):
+            put_text(img, "AI head: not found", (10, h - 18), scale=0.46, color=(0, 255, 255))
 
     for item in overlay.hot_objects:
         x0, y0, x1, y1 = item.bbox
@@ -1868,9 +1944,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thermal-face-min-c", type=float, default=30.0, help="Thermal-only face lower threshold. Default: 30.")
     parser.add_argument("--thermal-face-max-c", type=float, default=43.0, help="Thermal-only face upper threshold. Default: 43.")
     parser.add_argument("--thermal-face-min-area", type=int, default=80, help="Minimum warm connected-component area for thermal forehead fallback. Default: 80.")
+    parser.add_argument("--thermal-head-height-ratio", type=float, default=0.42, help="Upper component ratio used as thermal head candidate. Default: 0.42.")
+    parser.add_argument("--thermal-head-min-h", type=float, default=20.0, help="Minimum thermal head candidate height in pixels. Default: 20.")
+    parser.add_argument("--thermal-head-smooth", type=float, default=0.45, help="Head bbox temporal smoothing amount. Default: 0.45.")
     parser.add_argument("--thermal-forehead-top-ratio", type=float, default=0.18, help="Thermal fallback forehead top ratio inside detected head area. Default: 0.18.")
     parser.add_argument("--thermal-forehead-bottom-ratio", type=float, default=0.36, help="Thermal fallback forehead bottom ratio inside detected head area. Default: 0.36.")
-    parser.add_argument("--thermal-forehead-width-ratio", type=float, default=0.34, help="Thermal fallback forehead width ratio inside detected person area. Default: 0.34.")
+    parser.add_argument("--thermal-forehead-width-ratio", type=float, default=0.34, help="Thermal fallback forehead width ratio inside detected head area. Default: 0.34.")
     parser.add_argument("--hot-threshold-c", type=float, default=60.0, help="Hot object threshold in Celsius. Default: 60.")
     parser.add_argument("--hot-min-area", type=int, default=8, help="Minimum thermal pixels for a hot object. Default: 8.")
     parser.add_argument("--hot-persist-s", type=float, default=2.0, help="Seconds a hot object must persist before alert. Default: 2.")
