@@ -50,7 +50,7 @@ from typing import Optional, Sequence, Tuple, List, Any
 import cv2
 import numpy as np
 
-from tc001_face import DigitalFaceDetector, FaceBox, FaceTrack, update_face_track
+from tc001_face import DigitalFaceDetector, FaceBox, FaceTrack, FaceTracker, update_face_tracks
 from tc001_sdk import TC001SdkCamera, TC001SdkFrame, TC001_FPS, TC001_HEIGHT, TC001_WIDTH
 
 try:
@@ -704,7 +704,7 @@ def polygon_max_temperature_c(temp_c: Optional[np.ndarray], polygon: np.ndarray)
     return float(np.nanmax(values))
 
 
-def draw_face_overlay(
+def draw_one_face_overlay(
     img: np.ndarray,
     raw_thermal: ThermalFrame,
     oriented_thermal: ThermalFrame,
@@ -733,7 +733,7 @@ def draw_face_overlay(
 
     cv2.polylines(img, [pts_i], isClosed=True, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
     status = track.status if track.status and track.status != "NO FACE" else "FACE"
-    label = f"{status} {track.box.confidence * 100:.0f}%"
+    label = f"P{track.track_id} {status} {track.box.confidence * 100:.0f}%"
     face_temp_c = polygon_max_temperature_c(raw_thermal.temp_c, mapped)
     if face_temp_c is not None:
         label += f" | max {fmt_temp(face_temp_c, state.unit, raw_thermal.approx_temps)}"
@@ -742,17 +742,40 @@ def draw_face_overlay(
     put_text(img, label, (max(8, x), max(22, y - 8)), scale=0.45, color=(0, 255, 0))
 
 
-def draw_digital_debug(frame: np.ndarray, track: FaceTrack, alignment: Alignment, source: str, rotate: int) -> np.ndarray:
+def draw_face_overlay(
+    img: np.ndarray,
+    raw_thermal: ThermalFrame,
+    oriented_thermal: ThermalFrame,
+    digital_shape: Tuple[int, int],
+    tracker: FaceTracker,
+    alignment: Alignment,
+    state: ViewerState,
+) -> None:
+    for track in tracker.active_tracks(confirmed_only=True):
+        draw_one_face_overlay(img, raw_thermal, oriented_thermal, digital_shape, track, alignment, state)
+
+
+def draw_digital_debug(frame: np.ndarray, tracker: FaceTracker, alignment: Alignment, source: str, rotate: int) -> np.ndarray:
     out = frame.copy()
-    if track.box is not None:
-        x0, y0 = int(track.box.x), int(track.box.y)
-        x1, y1 = int(track.box.x + track.box.w), int(track.box.y + track.box.h)
-        color = (0, 200, 255) if track.status == "HELD" else (0, 255, 0)
-        cv2.rectangle(out, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
-        label = f"{track.status} {track.box.confidence * 100:.0f}%"
-        if track.detector_name and track.detector_name not in ("none", "held"):
-            label += f" ({track.detector_name})"
-        put_text(out, label, (x0, max(20, y0 - 8)), scale=0.5, color=color)
+    tracks = tracker.active_tracks()
+    if tracks:
+        for track in tracks:
+            if track.box is None:
+                continue
+            x0, y0 = int(track.box.x), int(track.box.y)
+            x1, y1 = int(track.box.x + track.box.w), int(track.box.y + track.box.h)
+            if not track.confirmed:
+                color = (0, 255, 255)
+            elif track.status == "HELD":
+                color = (0, 200, 255)
+            else:
+                color = (0, 255, 0)
+            cv2.rectangle(out, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+            status = f"CANDIDATE {track.status}" if not track.confirmed else track.status
+            label = f"P{track.track_id} {status} {track.box.confidence * 100:.0f}%"
+            if track.detector_name and track.detector_name not in ("none", "held"):
+                label += f" ({track.detector_name})"
+            put_text(out, label, (x0, max(20, y0 - 8)), scale=0.5, color=color)
     else:
         put_text(out, "NO FACE", (8, 24), scale=0.55, color=(0, 255, 255))
     put_text(out, f"Digital source: {source} | rotate {rotate} | {out.shape[1]}x{out.shape[0]} | alignment: {alignment.mode}", (8, out.shape[0] - 12), scale=0.42)
@@ -1403,6 +1426,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--face-detect-interval", type=int, default=3, help="Run face detection every N frames, then track/smooth between detections. Default: 3.")
     parser.add_argument("--face-hold-frames", type=int, default=15, help="Keep the last face box for this many frames after missed detections. Default: 15.")
     parser.add_argument("--face-smoothing", type=float, default=0.65, help="EMA smoothing for face box coordinates. Default: 0.65.")
+    parser.add_argument("--max-faces", type=int, default=5, help="Maximum number of people/face tracks to show. Default: 5.")
+    parser.add_argument("--head-fallback", choices=["off", "auto", "always"], default="auto", help="Use thermal/bright-region head fallback. Default: auto.")
+    parser.add_argument("--head-confirm-frames", type=int, default=2, help="Detection frames required before showing a HEAD TRACK on thermal view. Default: 2.")
+    parser.add_argument("--min-head-confidence", type=float, default=0.65, help="Assigned confidence for accepted head fallback boxes. Default: 0.65.")
     parser.add_argument("--digital-source", choices=["sdk-top", "opencv"], default="sdk-top", help="Digital/visual source for AI. Default: sdk-top.")
     parser.add_argument("--digital-device", type=int, default=1, help="OpenCV digital/visual device for TC001 Plus AI. Default: 1.")
     parser.add_argument("--digital-backend", choices=["auto", "msmf", "dshow", "any"], default="msmf", help="OpenCV backend used only for --digital-source opencv. Default: msmf.")
@@ -1477,7 +1504,7 @@ def main() -> int:
     digital_cap: Optional[cv2.VideoCapture] = None
     sdk_cam: Optional[TC001SdkCamera] = None
     face_detector: Optional[DigitalFaceDetector] = None
-    face_track = FaceTrack()
+    face_tracker = FaceTracker()
     alignment = load_alignment(args.alignment_file, args.alignment)
 
     if args.sdk_raw:
@@ -1536,7 +1563,11 @@ def main() -> int:
 
     if args.face_detect:
         face_detector = DigitalFaceDetector(args.face_model, args.face_min_confidence)
-        print(f"Face detection enabled: detector={face_detector.name}, digital_source={args.digital_source}, alignment={alignment.mode}.")
+        print(
+            f"Face detection enabled: detector={face_detector.name}, "
+            f"digital_source={args.digital_source}, alignment={alignment.mode}, "
+            f"max_faces={args.max_faces}, head_fallback={args.head_fallback}."
+        )
 
     if args.calibrate_alignment:
         if sdk_cam is None:
@@ -1667,14 +1698,18 @@ def main() -> int:
             if use_digital_ai:
                 digital_frame = select_digital_frame(args, sdk_frame, digital_cap)
                 if digital_frame is not None and face_detector is not None:
-                    face_track = update_face_track(
+                    face_tracker = update_face_tracks(
                         face_detector,
-                        face_track,
+                        face_tracker,
                         digital_frame,
                         frame_index,
                         args.face_detect_interval,
                         args.face_hold_frames,
                         args.face_smoothing,
+                        args.max_faces,
+                        args.head_fallback,
+                        args.head_confirm_frames,
+                        args.min_head_confidence,
                     )
 
             if sdk_cam is not None and temp_c is not None:
@@ -1698,11 +1733,11 @@ def main() -> int:
             heatmap, contrast_range = make_heatmap(thermal.display_source, state)
             heatmap = resize_to_window(heatmap, state.fit_window)
             if digital_frame is not None and args.face_detect:
-                draw_face_overlay(heatmap, thermal_raw, thermal, digital_frame.shape[:2], face_track, alignment, state)
+                draw_face_overlay(heatmap, thermal_raw, thermal, digital_frame.shape[:2], face_tracker, alignment, state)
             draw_hud(heatmap, thermal, state, fps_smooth, contrast_range, recorder)
 
             if digital_frame is not None and args.show_digital_debug:
-                cv2.imshow("TC001 Plus Digital Face Debug", draw_digital_debug(digital_frame, face_track, alignment, args.digital_source, args.digital_rotate))
+                cv2.imshow("TC001 Plus Digital Face Debug", draw_digital_debug(digital_frame, face_tracker, alignment, args.digital_source, args.digital_rotate))
 
             if state.recording and recorder.writer is not None:
                 out = heatmap

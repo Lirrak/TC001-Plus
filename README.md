@@ -86,7 +86,17 @@ Face/head detection hien tai dung nhieu tang:
 - `PROFILE`: detect mat nghieng bang profile cascade.
 - `HEAD TRACK`: fallback theo vung dau/than tren sang trong anh `sdk-top`.
 - `HELD`: tam giu box cu khi mat detector miss trong vai frame.
+- `CANDIDATE`: box moi/chua du on dinh, chi hien trong debug va chua ve len thermal.
 - `NO FACE`: chua co box hop le.
+
+Viewer ho tro nhieu nguoi trong cung khung hinh. Moi nguoi duoc gan nhan `P1`,
+`P2`, ... va co box/nhiet do ROI rieng. So nguoi hien thi toi da mac dinh la 5,
+co the doi bang `--max-faces`.
+
+De giam nhieu ROI, `HEAD TRACK` mac dinh chay o che do `--head-fallback auto`.
+Fallback nay de bat mat nghieng/anh xam kho detect, nhung de nhiem hon `FACE`
+va `PROFILE`, nen box head phai du on dinh qua `--head-confirm-frames` truoc khi
+hien tren thermal view.
 
 Voi nguon `sdk-top`, anh digital co the la grayscale/IR-like, khong phai RGB
 webcam binh thuong. Mat nghieng, deo kinh den, bi cat mat hoac qua toi/sang deu
@@ -120,6 +130,24 @@ Neu khong thay face detection:
 
 ```powershell
 py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug
+```
+
+Gioi han toi da 2 nguoi neu muon giao dien gon hon:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2
+```
+
+Lenh khuyen nghi khi can giam nhieu box ROI:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback auto
+```
+
+Neu van bi nhieu tu `HEAD TRACK`, tat fallback nay de chi dung face/profile:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback off
 ```
 
 - Neu debug khong hien anh digital that voi `sdk-top`, thu fallback OpenCV/MSMF.
@@ -226,8 +254,12 @@ Trang thai hien tai:
 - `--show-digital-debug`: mo cua so debug rieng cho camera digital va bbox mat.
 - `--digital-device 1`: mac dinh, khong dung webcam camera0.
 - `--digital-split right`: lay nua phai cua frame ghep lam anh digital.
-- Label `FACE xx% | max yy.y degC`: hien thi nhiet do cao nhat trong vung face
-  ROI da map sang ma tran nhiet. Label co the la `FACE`, `PROFILE`,
+- `--max-faces 5`: so nguoi/face tracks toi da hien thi.
+- `--head-fallback auto`: bat/tat fallback head de giam nhieu ROI.
+- `--head-confirm-frames 2`: so frame detect can co truoc khi `HEAD TRACK`
+  duoc ve len thermal view.
+- Label `P1 FACE xx% | max yy.y degC`: hien thi nhiet do cao nhat trong ROI
+  tung nguoi da map sang ma tran nhiet. Label co the la `FACE`, `PROFILE`,
   `HEAD TRACK` hoac `HELD` tuy detector dang dung.
 - `--calibrate-alignment`: click 4 diem digital/thermal de luu homography.
 - `--alignment-file tc001_alignment.json`: file map digital -> thermal.

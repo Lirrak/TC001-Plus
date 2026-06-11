@@ -1,2 +1,5 @@
 Lệnh chạy TC001 Plus
 py .\tc001_thermal_viewer_v5.py --sdk-raw
+
+Detect mặt người
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug
