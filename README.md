@@ -50,6 +50,13 @@ Neu khong dung `requirements.txt`, co the cai truc tiep:
 py -m pip install opencv-python numpy
 ```
 
+Tuy chon: cai MediaPipe de face detection tot hon. Neu khong cai, chuong trinh
+se fallback sang Haar cascade cua OpenCV:
+
+```powershell
+py -m pip install mediapipe
+```
+
 ## Lenh chay chinh
 
 Mo viewer voi nhiet do that tu TC001 Plus:
@@ -59,6 +66,54 @@ py .\tc001_thermal_viewer_v5.py --sdk-raw
 ```
 
 Lenh nay la che do nen dung khi can do nhiet do that.
+
+Mo viewer SDK raw va detect mat bang nguon AI mac dinh `sdk-top`:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug
+```
+
+Mac dinh AI dung `--digital-source sdk-top`, tuc la decode nua tren cua frame
+SDK `256x384 YUY2` thay vi mo them OpenCV camera1. Neu `sdk-top` khong ra anh
+digital that, thu fallback OpenCV/MSMF:
+
+Frame digital duoc xoay rieng bang `--digital-rotate 90` theo mac dinh. Neu anh
+bi xoay nguoc huong, thu `--digital-rotate 270`.
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --digital-source opencv --digital-backend msmf --digital-device 1 --digital-split right --show-digital-debug
+```
+
+Neu chua co file calibration, box mat van co the hien thi bang mapping tam thoi.
+De map chinh xac hon, hay calibration 4 diem:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --calibrate-alignment
+```
+
+Sau khi tao `tc001_alignment.json`, chay lai:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect
+```
+
+Face detection mac dinh khong mo webcam `camera0`. Neu dung fallback
+`--digital-source opencv` va truyen `--digital-device 0`, chuong trinh se tu choi
+de tranh dung nham webcam laptop.
+
+Neu khong thay face detection:
+
+- Nen bat debug de xem dung camera digital:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug
+```
+
+- Neu debug khong hien anh digital that voi `sdk-top`, thu fallback OpenCV/MSMF.
+- Neu debug co anh mat nhung hien `NO FACE`, detector dang khong nhan mat trong
+  frame do. Hay nhin thang camera, tranh bi cat mat/qua toi/qua nghieng.
+- Neu co bbox tren debug nhung bbox tren thermal bi lech, can chay calibration
+  4 diem de tao `tc001_alignment.json`.
 
 ## Cac lenh debug huu ich
 
@@ -132,7 +187,10 @@ py .\tc001_thermal_viewer_v5.py --sdk-raw
 ## Cau truc thu muc
 
 ```text
-tc001_thermal_viewer_v5.py       Main viewer hien tai
+tc001_thermal_viewer_v5.py       Entry point, UI/render/HUD/calibration flow
+tc001_sdk.py                     TOPDON SDK/libiruvc radiometric reader
+tc001_face.py                    Face detector va face tracking
+tc001_alignment.json             Local calibration file, khong commit vao repo
 tools/probes/                    Script probe SDK/libusb/TopView
 tools/experiments/               Script thu nghiem raw frame
 archive/legacy_viewers/          Cac ban viewer cu
@@ -146,6 +204,18 @@ Huong thiet ke du kien la tach thanh hai luong:
 
 - TC001 Plus SDK doc ma tran nhiet that `256x192`.
 - OpenCV `cam1` doc RGB/visual stream cho AI detect.
+
+Trang thai hien tai:
+
+- `--face-detect`: detect mat tren digital stream cua TC001 Plus.
+- `--show-digital-debug`: mo cua so debug rieng cho camera digital va bbox mat.
+- `--digital-device 1`: mac dinh, khong dung webcam camera0.
+- `--digital-split right`: lay nua phai cua frame ghep lam anh digital.
+- Label `FACE xx% | max yy.y degC`: hien thi nhiet do cao nhat trong vung face
+  ROI da map sang ma tran nhiet.
+- `--calibrate-alignment`: click 4 diem digital/thermal de luu homography.
+- `--alignment-file tc001_alignment.json`: file map digital -> thermal.
+- `--alignment simple-scale`: mapping tam thoi khi chua calibration.
 
 AI co the dung:
 

@@ -40,15 +40,18 @@ import os
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import argparse
-import ctypes
+import json
 import platform
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, List, Dict, Any
+from typing import Optional, Sequence, Tuple, List, Any
 
 import cv2
 import numpy as np
+
+from tc001_face import DigitalFaceDetector, FaceBox, FaceTrack, update_face_track
+from tc001_sdk import TC001SdkCamera, TC001SdkFrame, TC001_FPS, TC001_HEIGHT, TC001_WIDTH
 
 try:
     cv2.setLogLevel(0)
@@ -57,11 +60,6 @@ except Exception:
 
 
 WINDOW_NAME = "TOPDON TC001 Thermal Viewer v5"
-
-# TC001 / TC001 Plus commonly uses a 256 x 192 thermal sensor.
-TC001_WIDTH = 256
-TC001_HEIGHT = 192
-TC001_FPS = 25
 
 COLORMAPS: Tuple[Tuple[str, int], ...] = tuple(
     (name, cmap)
@@ -127,113 +125,12 @@ class OpenOptions:
     raw_height_factor: int = 2
 
 
-class TC001SdkCamera:
-    """Read real TC001 Plus radiometric frames through TOPDON's libiruvc.dll."""
-
-    WIDTH = TC001_WIDTH
-    HEIGHT = TC001_HEIGHT * 2
-    FRAME_SIZE = WIDTH * HEIGHT * 2
-    FPS = TC001_FPS
-
-    def __init__(self, dll_dir: str) -> None:
-        self.dll_dir = dll_dir
-        self.app_dir = os.path.dirname(os.path.dirname(dll_dir))
-        self.dll: Optional[ctypes.CDLL] = None
-        self.dev = ctypes.create_string_buffer(8192)
-        self.info = ctypes.create_string_buffer(8192)
-        self.stream = ctypes.create_string_buffer(0x40)
-        self.format_name = ctypes.create_string_buffer(b"YUY2")
-        self.frame_buf: Optional[int] = None
-        self.raw_buf = ctypes.create_string_buffer(self.FRAME_SIZE)
-
-    def _check(self, code: int, name: str) -> None:
-        if code < 0:
-            raise RuntimeError(f"{name} failed: {code}")
-
-    def open(self) -> None:
-        if not os.path.exists(os.path.join(self.dll_dir, "libiruvc.dll")):
-            raise RuntimeError(f"libiruvc.dll was not found in: {self.dll_dir}")
-
-        os.add_dll_directory(self.dll_dir)
-        if os.path.isdir(self.app_dir):
-            os.add_dll_directory(self.app_dir)
-
-        dll = ctypes.CDLL(os.path.join(self.dll_dir, "libiruvc.dll"))
-        self.dll = dll
-
-        dll.uvc_camera_init.restype = ctypes.c_int
-        dll.uvc_camera_list.argtypes = [ctypes.c_void_p]
-        dll.uvc_camera_list.restype = ctypes.c_int
-        dll.uvc_camera_info_get.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        dll.uvc_camera_info_get.restype = ctypes.c_int
-        dll.uvc_camera_open.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        dll.uvc_camera_open.restype = ctypes.c_int
-        dll.uvc_camera_stream_start.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        dll.uvc_camera_stream_start.restype = ctypes.c_int
-        dll.uvc_frame_buf_create.argtypes = [ctypes.c_void_p]
-        dll.uvc_frame_buf_create.restype = ctypes.c_void_p
-        dll.uvc_frame_get.argtypes = [ctypes.c_void_p]
-        dll.uvc_frame_get.restype = ctypes.c_int
-        dll.uvc_camera_stream_close.restype = ctypes.c_int
-        dll.uvc_frame_buf_release.argtypes = [ctypes.c_void_p]
-        dll.uvc_frame_buf_release.restype = ctypes.c_int
-        dll.uvc_camera_close.restype = ctypes.c_int
-        dll.uvc_camera_release.restype = ctypes.c_int
-
-        ctypes.c_void_p.from_buffer(self.stream, 0x10).value = ctypes.addressof(self.format_name)
-        ctypes.c_int.from_buffer(self.stream, 0x18).value = self.WIDTH
-        ctypes.c_int.from_buffer(self.stream, 0x1C).value = self.HEIGHT
-        ctypes.c_int.from_buffer(self.stream, 0x20).value = self.FRAME_SIZE
-        ctypes.c_int.from_buffer(self.stream, 0x24).value = self.FPS
-        ctypes.c_int.from_buffer(self.stream, 0x28).value = self.FRAME_SIZE
-
-        self._check(dll.uvc_camera_init(), "uvc_camera_init")
-        self._check(dll.uvc_camera_list(ctypes.byref(self.dev)), "uvc_camera_list")
-        self._check(dll.uvc_camera_info_get(ctypes.byref(self.dev), ctypes.byref(self.info)), "uvc_camera_info_get")
-
-        # Offset 160 is the SDK's 256x384@25 mode in the info table.
-        self._check(dll.uvc_camera_open(ctypes.byref(self.dev), ctypes.byref(self.info, 160)), "uvc_camera_open")
-
-        self.frame_buf = dll.uvc_frame_buf_create(ctypes.byref(self.stream))
-        if not self.frame_buf:
-            raise RuntimeError("uvc_frame_buf_create failed")
-
-        self._check(dll.uvc_camera_stream_start(ctypes.byref(self.stream), None), "uvc_camera_stream_start")
-
-    def read_temp_c(self, timeout_s: float = 1.0) -> Optional[np.ndarray]:
-        if self.dll is None:
-            raise RuntimeError("SDK camera is not open")
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            ret = self.dll.uvc_frame_get(ctypes.byref(self.raw_buf))
-            if ret == 0:
-                raw = np.frombuffer(bytes(self.raw_buf), dtype="<u2").reshape((self.HEIGHT, self.WIDTH))
-                temp_raw = raw[TC001_HEIGHT : self.HEIGHT, :]
-                return temp_raw.astype(np.float32) / 64.0 - 273.15
-            time.sleep(0.005)
-        return None
-
-    def close(self) -> None:
-        if self.dll is None:
-            return
-        try:
-            self.dll.uvc_camera_stream_close()
-        except Exception:
-            pass
-        if self.frame_buf:
-            try:
-                self.dll.uvc_frame_buf_release(ctypes.c_void_p(self.frame_buf))
-            except Exception:
-                pass
-        try:
-            self.dll.uvc_camera_close()
-        except Exception:
-            pass
-        try:
-            self.dll.uvc_camera_release()
-        except Exception:
-            pass
-        self.dll = None
+@dataclass
+class Alignment:
+    mode: str
+    matrix: Optional[np.ndarray] = None
+    digital_size: Optional[Tuple[int, int]] = None
+    thermal_size: Optional[Tuple[int, int]] = None
 
 
 def timestamp() -> str:
@@ -624,6 +521,347 @@ def split_frame_if_needed(frame: np.ndarray, split_mode: int) -> np.ndarray:
         return cv2.resize(cropped, (half_w, h // 2)) if h == 480 else cropped
     return frame
 
+
+def extract_digital_frame(frame: np.ndarray, split: str) -> np.ndarray:
+    """Return the RGB/visual part of the TC001 Plus OpenCV feed."""
+    if frame is None or frame.ndim < 2:
+        return frame
+    split = (split or "right").lower()
+    h, w = frame.shape[:2]
+    half_w = w // 2
+
+    if split == "none":
+        return frame
+    if split == "left":
+        cropped = frame[:, :half_w]
+    elif split == "right":
+        cropped = frame[:, half_w:]
+    else:
+        cropped = frame
+
+    # TC001 Plus side-by-side preview is commonly 640x480 while each half is
+    # effectively 320x240. Keep detector input in the natural aspect ratio.
+    if h == 480 and split in ("left", "right"):
+        return cv2.resize(cropped, (half_w, h // 2), interpolation=cv2.INTER_AREA)
+    return cropped
+
+
+def orient_digital_frame(frame: Optional[np.ndarray], rotate: int, flip_h: bool, flip_v: bool) -> Optional[np.ndarray]:
+    if frame is None:
+        return None
+    out = frame
+    rotate = rotate % 360
+    if rotate == 90:
+        out = cv2.rotate(out, cv2.ROTATE_90_CLOCKWISE)
+    elif rotate == 180:
+        out = cv2.rotate(out, cv2.ROTATE_180)
+    elif rotate == 270:
+        out = cv2.rotate(out, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if flip_h:
+        out = cv2.flip(out, 1)
+    if flip_v:
+        out = cv2.flip(out, 0)
+    return out
+
+
+def load_alignment(path: str, mode: str) -> Alignment:
+    if mode == "simple-scale":
+        return Alignment(mode="simple-scale")
+    if not path or not os.path.exists(path):
+        return Alignment(mode="missing")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        matrix = np.asarray(data.get("homography"), dtype=np.float32)
+        if matrix.shape != (3, 3):
+            raise ValueError("homography must be a 3x3 matrix")
+        digital_size = tuple(data.get("digital_size", []))
+        thermal_size = tuple(data.get("thermal_size", []))
+        return Alignment(
+            mode="homography",
+            matrix=matrix,
+            digital_size=(int(digital_size[0]), int(digital_size[1])) if len(digital_size) == 2 else None,
+            thermal_size=(int(thermal_size[0]), int(thermal_size[1])) if len(thermal_size) == 2 else None,
+        )
+    except Exception as exc:
+        print(f"WARNING: Could not load alignment file {path!r}: {exc}")
+        return Alignment(mode="invalid")
+
+
+def save_alignment(path: str, matrix: np.ndarray, digital_size: Tuple[int, int], thermal_size: Tuple[int, int]) -> None:
+    data = {
+        "version": 1,
+        "type": "digital_to_thermal_homography",
+        "digital_size": [int(digital_size[0]), int(digital_size[1])],
+        "thermal_size": [int(thermal_size[0]), int(thermal_size[1])],
+        "homography": matrix.astype(float).tolist(),
+        "created_at": timestamp(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def map_points_to_thermal(points: np.ndarray, digital_shape: Tuple[int, int], thermal_shape: Tuple[int, int], alignment: Alignment) -> Optional[np.ndarray]:
+    if points.size == 0:
+        return None
+    src_h, src_w = digital_shape[:2]
+    dst_h, dst_w = thermal_shape[:2]
+    pts = points.astype(np.float32).reshape(-1, 2)
+
+    if alignment.mode == "homography" and alignment.matrix is not None:
+        mapped = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), alignment.matrix).reshape(-1, 2)
+    elif alignment.mode in ("simple-scale", "missing", "invalid"):
+        sx = dst_w / max(src_w, 1)
+        sy = dst_h / max(src_h, 1)
+        mapped = pts.copy()
+        mapped[:, 0] *= sx
+        mapped[:, 1] *= sy
+    else:
+        return None
+
+    mapped[:, 0] = np.clip(mapped[:, 0], 0, max(dst_w - 1, 0))
+    mapped[:, 1] = np.clip(mapped[:, 1], 0, max(dst_h - 1, 0))
+    return mapped
+
+
+def face_box_points(box: FaceBox) -> np.ndarray:
+    x0, y0 = box.x, box.y
+    x1, y1 = box.x + box.w, box.y + box.h
+    return np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype=np.float32)
+
+
+def orient_points(points: np.ndarray, source_shape: Tuple[int, int], state: ViewerState) -> np.ndarray:
+    h, w = source_shape[:2]
+    out = points.astype(np.float32).copy()
+    rotate = state.rotate % 360
+
+    if rotate == 90:
+        x = out[:, 0].copy()
+        y = out[:, 1].copy()
+        out[:, 0] = h - 1 - y
+        out[:, 1] = x
+        w, h = h, w
+    elif rotate == 180:
+        out[:, 0] = w - 1 - out[:, 0]
+        out[:, 1] = h - 1 - out[:, 1]
+    elif rotate == 270:
+        x = out[:, 0].copy()
+        y = out[:, 1].copy()
+        out[:, 0] = y
+        out[:, 1] = w - 1 - x
+        w, h = h, w
+
+    if state.flip_h:
+        out[:, 0] = w - 1 - out[:, 0]
+    if state.flip_v:
+        out[:, 1] = h - 1 - out[:, 1]
+    return out
+
+
+def inverse_orient_points(points: np.ndarray, raw_shape: Tuple[int, int], state: ViewerState) -> np.ndarray:
+    raw_h, raw_w = raw_shape[:2]
+    rotate = state.rotate % 360
+    if rotate in (90, 270):
+        oriented_w, oriented_h = raw_h, raw_w
+    else:
+        oriented_w, oriented_h = raw_w, raw_h
+
+    out = points.astype(np.float32).copy()
+    if state.flip_h:
+        out[:, 0] = oriented_w - 1 - out[:, 0]
+    if state.flip_v:
+        out[:, 1] = oriented_h - 1 - out[:, 1]
+
+    if rotate == 90:
+        x = out[:, 0].copy()
+        y = out[:, 1].copy()
+        out[:, 0] = y
+        out[:, 1] = raw_h - 1 - x
+    elif rotate == 180:
+        out[:, 0] = raw_w - 1 - out[:, 0]
+        out[:, 1] = raw_h - 1 - out[:, 1]
+    elif rotate == 270:
+        x = out[:, 0].copy()
+        y = out[:, 1].copy()
+        out[:, 0] = raw_w - 1 - y
+        out[:, 1] = x
+
+    out[:, 0] = np.clip(out[:, 0], 0, max(raw_w - 1, 0))
+    out[:, 1] = np.clip(out[:, 1], 0, max(raw_h - 1, 0))
+    return out
+
+
+def polygon_max_temperature_c(temp_c: Optional[np.ndarray], polygon: np.ndarray) -> Optional[float]:
+    if temp_c is None or temp_c.size == 0 or polygon.size == 0:
+        return None
+    mask = np.zeros(temp_c.shape[:2], dtype=np.uint8)
+    pts = np.round(polygon).astype(np.int32).reshape(-1, 1, 2)
+    cv2.fillPoly(mask, [pts], 255)
+    values = temp_c[mask > 0]
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+    return float(np.nanmax(values))
+
+
+def draw_face_overlay(
+    img: np.ndarray,
+    raw_thermal: ThermalFrame,
+    oriented_thermal: ThermalFrame,
+    digital_shape: Tuple[int, int],
+    track: FaceTrack,
+    alignment: Alignment,
+    state: ViewerState,
+) -> None:
+    if track.box is None:
+        return
+
+    raw_thermal_shape = raw_thermal.temp_c.shape[:2] if raw_thermal.temp_c is not None else raw_thermal.display_source.shape[:2]
+    mapped = map_points_to_thermal(face_box_points(track.box), digital_shape, raw_thermal_shape, alignment)
+    if mapped is None:
+        return
+
+    mapped_oriented = orient_points(mapped, raw_thermal_shape, state)
+    src_h, src_w = oriented_thermal.display_source.shape[:2]
+    dst_h, dst_w = img.shape[:2]
+    sx = dst_w / max(src_w, 1)
+    sy = dst_h / max(src_h, 1)
+    draw_pts = mapped_oriented.copy()
+    draw_pts[:, 0] *= sx
+    draw_pts[:, 1] *= sy
+    pts_i = np.round(draw_pts).astype(np.int32).reshape(-1, 1, 2)
+
+    cv2.polylines(img, [pts_i], isClosed=True, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+    label = f"FACE {track.box.confidence * 100:.0f}%"
+    face_temp_c = polygon_max_temperature_c(raw_thermal.temp_c, mapped)
+    if face_temp_c is not None:
+        label += f" | max {fmt_temp(face_temp_c, state.unit, raw_thermal.approx_temps)}"
+    x = int(np.min(draw_pts[:, 0]))
+    y = int(np.min(draw_pts[:, 1]))
+    put_text(img, label, (max(8, x), max(22, y - 8)), scale=0.45, color=(0, 255, 0))
+
+
+def draw_digital_debug(frame: np.ndarray, track: FaceTrack, alignment: Alignment, source: str, rotate: int) -> np.ndarray:
+    out = frame.copy()
+    if track.box is not None:
+        x0, y0 = int(track.box.x), int(track.box.y)
+        x1, y1 = int(track.box.x + track.box.w), int(track.box.y + track.box.h)
+        cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 0), 2, cv2.LINE_AA)
+        put_text(out, f"{track.detector_name} {track.box.confidence * 100:.0f}%", (x0, max(20, y0 - 8)), scale=0.5, color=(0, 255, 0))
+    else:
+        put_text(out, "NO FACE", (8, 24), scale=0.55, color=(0, 255, 255))
+    put_text(out, f"Digital source: {source} | rotate {rotate} | {out.shape[1]}x{out.shape[0]} | alignment: {alignment.mode}", (8, out.shape[0] - 12), scale=0.42)
+    return out
+
+
+def collect_four_points(window: str, image: np.ndarray, title: str) -> List[Tuple[float, float]]:
+    points: List[Tuple[float, float]] = []
+    display = image.copy()
+
+    def redraw() -> None:
+        view = display.copy()
+        put_text(view, title, (10, 24), scale=0.52, color=(0, 255, 255))
+        put_text(view, "Click 4 matching points. Press r to reset, ESC to cancel.", (10, 48), scale=0.42)
+        for i, (x, y) in enumerate(points):
+            cv2.circle(view, (int(x), int(y)), 5, (0, 255, 255), -1, cv2.LINE_AA)
+            put_text(view, str(i + 1), (int(x) + 8, int(y) - 8), scale=0.45, color=(0, 255, 255))
+        cv2.imshow(window, view)
+
+    def on_mouse(event: int, x: int, y: int, _flags: int, _param: Any) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
+            points.append((float(x), float(y)))
+            redraw()
+
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window, on_mouse)
+    redraw()
+    while len(points) < 4:
+        key = cv2.waitKey(20) & 0xFF
+        if key == 27:
+            points = []
+            break
+        if key == ord("r"):
+            points.clear()
+            redraw()
+    cv2.setMouseCallback(window, lambda *_args: None)
+    cv2.destroyWindow(window)
+    return points
+
+
+def read_opencv_digital_frame(args: argparse.Namespace, digital_cap: Optional[cv2.VideoCapture]) -> Optional[np.ndarray]:
+    if digital_cap is None:
+        return None
+    ok, digital_raw = digital_cap.read()
+    if not ok or digital_raw is None:
+        return None
+    return orient_digital_frame(
+        extract_digital_frame(digital_raw, args.digital_split),
+        args.digital_rotate,
+        args.digital_flip_h,
+        args.digital_flip_v,
+    )
+
+
+def open_digital_camera(index: int, fps: int, backend: str = "msmf") -> Tuple[cv2.VideoCapture, str]:
+    backend_name, backend_value = backend_candidates(backend)[0]
+    cap = cv2.VideoCapture(index, backend_value)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FPS, fps)
+        for _ in range(8):
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                break
+            time.sleep(0.03)
+    return cap, backend_name
+
+
+def select_digital_frame(args: argparse.Namespace, sdk_frame: Optional[TC001SdkFrame], digital_cap: Optional[cv2.VideoCapture]) -> Optional[np.ndarray]:
+    if args.digital_source == "sdk-top":
+        return orient_digital_frame(
+            None if sdk_frame is None else sdk_frame.preview_bgr,
+            args.digital_rotate,
+            args.digital_flip_h,
+            args.digital_flip_v,
+        )
+    return read_opencv_digital_frame(args, digital_cap)
+
+
+def run_alignment_calibration(args: argparse.Namespace, sdk_cam: TC001SdkCamera, digital_cap: Optional[cv2.VideoCapture]) -> bool:
+    print("Calibration: capturing one digital frame and one SDK thermal frame...")
+    sdk_frame = sdk_cam.read_frame(timeout_s=2.0)
+    digital = select_digital_frame(args, sdk_frame, digital_cap)
+    if sdk_frame is None or digital is None:
+        print("ERROR: Could not capture calibration frames from SDK and digital camera.")
+        if args.digital_source == "sdk-top":
+            print("The SDK top-half preview was empty. Retry with --digital-source opencv if the visual stream is exposed separately.")
+        return False
+
+    temp_c = sdk_frame.temp_c
+    thermal_frame = ThermalFrame(display_source=temp_c, temp_c=temp_c, mode="sdk-radiometric")
+    thermal_oriented = apply_orientation(thermal_frame, ViewerState(rotate=int(args.rotate), flip_h=bool(args.flip_h), flip_v=bool(args.flip_v)))
+    thermal_preview, _ = make_heatmap(thermal_oriented.display_source, ViewerState())
+
+    print("Calibration: select the same 4 points in DIGITAL first, then THERMAL.")
+    digital_pts = collect_four_points("TC001 Digital Calibration", digital, "DIGITAL: click 4 points")
+    if len(digital_pts) != 4:
+        print("Calibration cancelled.")
+        return False
+    thermal_pts_oriented = collect_four_points("TC001 Thermal Calibration", thermal_preview, "THERMAL: click same 4 points")
+    if len(thermal_pts_oriented) != 4:
+        print("Calibration cancelled.")
+        return False
+
+    # The saved homography maps digital coordinates to the unrotated SDK matrix.
+    cal_state = ViewerState(rotate=int(args.rotate), flip_h=bool(args.flip_h), flip_v=bool(args.flip_v))
+    thermal_pts = inverse_orient_points(np.asarray(thermal_pts_oriented, dtype=np.float32), temp_c.shape[:2], cal_state)
+
+    matrix, _mask = cv2.findHomography(np.asarray(digital_pts, dtype=np.float32), thermal_pts, method=0)
+    if matrix is None:
+        print("ERROR: Could not compute homography from the selected points.")
+        return False
+    save_alignment(args.alignment_file, matrix, (digital.shape[1], digital.shape[0]), (temp_c.shape[1], temp_c.shape[0]))
+    print(f"Calibration saved: {os.path.abspath(args.alignment_file)}")
+    return True
 
 
 def probe_raw_streams(args: argparse.Namespace) -> int:
@@ -1140,7 +1378,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-estimate-temps", dest="estimate_temps", action="store_false", help="Disable temperature estimation.")
     parser.add_argument("--temp-scale", type=float, default=1.0, help="Calibration scale applied to decoded/estimated Celsius. Default: 1.0.")
     parser.add_argument("--temp-offset", type=float, default=0.0, help="Calibration offset in Celsius. Default: 0.0.")
-    parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0, help="Initial clockwise rotation. Default: 0.")
+    parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=90, help="Initial clockwise rotation for the thermal viewer. Default: 90.")
     parser.add_argument("--flip-h", action="store_true", help="Initial horizontal mirror flip.")
     parser.add_argument("--flip-v", action="store_true", help="Initial vertical flip.")
     parser.add_argument("--raw-request", action="store_true", help="Try to request a raw TC001-sized stream.")
@@ -1154,6 +1392,23 @@ def parse_args() -> argparse.Namespace:
         default=r"C:\Program Files\TOPDON\TopView\dll\dll_c001p",
         help="Directory containing TOPDON libiruvc.dll. Default: TopView dll_c001p folder.",
     )
+    parser.add_argument("--face-detect", action="store_true", help="Detect faces on the TC001 Plus digital camera stream and map the box to SDK thermal frames.")
+    parser.add_argument("--face-model", choices=["auto", "mediapipe", "haar"], default="auto", help="Face detector backend. Default: auto.")
+    parser.add_argument("--face-min-confidence", type=float, default=0.55, help="Minimum MediaPipe face confidence. Default: 0.55.")
+    parser.add_argument("--face-detect-interval", type=int, default=3, help="Run face detection every N frames, then track/smooth between detections. Default: 3.")
+    parser.add_argument("--face-hold-frames", type=int, default=15, help="Keep the last face box for this many frames after missed detections. Default: 15.")
+    parser.add_argument("--face-smoothing", type=float, default=0.65, help="EMA smoothing for face box coordinates. Default: 0.65.")
+    parser.add_argument("--digital-source", choices=["sdk-top", "opencv"], default="sdk-top", help="Digital/visual source for AI. Default: sdk-top.")
+    parser.add_argument("--digital-device", type=int, default=1, help="OpenCV digital/visual device for TC001 Plus AI. Default: 1.")
+    parser.add_argument("--digital-backend", choices=["auto", "msmf", "dshow", "any"], default="msmf", help="OpenCV backend used only for --digital-source opencv. Default: msmf.")
+    parser.add_argument("--digital-split", choices=["right", "left", "none", "both"], default="right", help="Which part of camera1 contains the digital image. Default: right.")
+    parser.add_argument("--digital-rotate", type=int, choices=[0, 90, 180, 270], default=90, help="Clockwise rotation applied only to the digital AI/debug frame. Default: 90.")
+    parser.add_argument("--digital-flip-h", action="store_true", help="Flip only the digital AI/debug frame horizontally.")
+    parser.add_argument("--digital-flip-v", action="store_true", help="Flip only the digital AI/debug frame vertically.")
+    parser.add_argument("--show-digital-debug", action="store_true", help="Show a separate window with digital camera face detection.")
+    parser.add_argument("--alignment", choices=["homography", "simple-scale"], default="homography", help="Digital-to-thermal mapping mode. Default: homography with simple-scale fallback if file is missing.")
+    parser.add_argument("--alignment-file", default="tc001_alignment.json", help="Path to digital-to-thermal homography JSON. Default: tc001_alignment.json.")
+    parser.add_argument("--calibrate-alignment", action="store_true", help="Capture digital and SDK frames, click 4 matching points, and save --alignment-file.")
     return parser.parse_args()
 
 
@@ -1166,6 +1421,12 @@ def main() -> int:
 
     if args.find_raw:
         return probe_raw_streams(args)
+
+    use_digital_ai = bool(args.face_detect or args.show_digital_debug or args.calibrate_alignment)
+    if use_digital_ai and not args.sdk_raw:
+        print("ERROR: AI/digital alignment modes require --sdk-raw.")
+        print("Use: py .\\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --digital-device 1 --show-digital-debug")
+        return 2
 
     device = args.device
     if device is None:
@@ -1208,7 +1469,11 @@ def main() -> int:
     )
 
     cap: Optional[cv2.VideoCapture] = None
+    digital_cap: Optional[cv2.VideoCapture] = None
     sdk_cam: Optional[TC001SdkCamera] = None
+    face_detector: Optional[DigitalFaceDetector] = None
+    face_track = FaceTrack()
+    alignment = load_alignment(args.alignment_file, args.alignment)
 
     if args.sdk_raw:
         print("Opening TC001 Plus through TOPDON SDK/libiruvc real radiometric stream...")
@@ -1249,6 +1514,41 @@ def main() -> int:
             return 1
 
         print(f"Opened device {device} with backend={used_backend}.")
+
+    if use_digital_ai and args.digital_source == "opencv":
+        if int(args.digital_device) == 0:
+            print("ERROR: --digital-device 0 is blocked for AI. TC001 Plus digital camera must use camera1.")
+            return 2
+        print(f"Opening TC001 Plus digital camera for AI on camera{args.digital_device} using backend={args.digital_backend}...")
+        digital_cap, digital_backend = open_digital_camera(int(args.digital_device), args.fps, args.digital_backend)
+        if not digital_cap.isOpened():
+            print(f"ERROR: Could not open TC001 Plus digital camera device {args.digital_device}.")
+            print("Run --list and confirm the TC001 Plus visual/digital stream index. Camera0 is intentionally not used for AI.")
+            return 1
+        print(f"Opened digital camera{args.digital_device} with backend={digital_backend}. Split={args.digital_split}.")
+    elif use_digital_ai:
+        print("Using SDK top-half preview as the AI digital source. OpenCV camera1 is not opened for AI.")
+
+    if args.face_detect:
+        face_detector = DigitalFaceDetector(args.face_model, args.face_min_confidence)
+        print(f"Face detection enabled: detector={face_detector.name}, digital_source={args.digital_source}, alignment={alignment.mode}.")
+
+    if args.calibrate_alignment:
+        if sdk_cam is None:
+            print("ERROR: --calibrate-alignment requires --sdk-raw so the thermal target is real radiometric TC001 data.")
+            if digital_cap is not None:
+                digital_cap.release()
+            return 2
+        if args.digital_source == "opencv" and digital_cap is None:
+            print("ERROR: --calibrate-alignment requires a readable --digital-device.")
+            return 2
+        ok = run_alignment_calibration(args, sdk_cam, digital_cap)
+        if digital_cap is not None:
+            digital_cap.release()
+        if sdk_cam is not None:
+            sdk_cam.close()
+        cv2.destroyAllWindows()
+        return 0 if ok else 1
 
     if args.probe:
         if sdk_cam is not None:
@@ -1319,12 +1619,16 @@ def main() -> int:
     fps_smooth = 0.0
     last_time = time.time()
     read_failures = 0
+    frame_index = 0
 
     try:
         while True:
             frame = None
+            digital_frame = None
+            sdk_frame: Optional[TC001SdkFrame] = None
             if sdk_cam is not None:
-                temp_c = sdk_cam.read_temp_c(timeout_s=1.0)
+                sdk_frame = sdk_cam.read_frame(timeout_s=1.0)
+                temp_c = sdk_frame.temp_c if sdk_frame is not None else None
                 ret = temp_c is not None
             elif cap is not None:
                 ret, frame = cap.read()
@@ -1353,6 +1657,20 @@ def main() -> int:
                 continue
 
             read_failures = 0
+            frame_index += 1
+
+            if use_digital_ai:
+                digital_frame = select_digital_frame(args, sdk_frame, digital_cap)
+                if digital_frame is not None and face_detector is not None:
+                    face_track = update_face_track(
+                        face_detector,
+                        face_track,
+                        digital_frame,
+                        frame_index,
+                        args.face_detect_interval,
+                        args.face_hold_frames,
+                        args.face_smoothing,
+                    )
 
             if sdk_cam is not None and temp_c is not None:
                 temp_c = temp_c * args.temp_scale + args.temp_offset
@@ -1370,10 +1688,16 @@ def main() -> int:
                     args.temp_scale,
                     args.temp_offset,
                 )
+            thermal_raw = thermal
             thermal = apply_orientation(thermal, state)
             heatmap, contrast_range = make_heatmap(thermal.display_source, state)
             heatmap = resize_to_window(heatmap, state.fit_window)
+            if digital_frame is not None and args.face_detect:
+                draw_face_overlay(heatmap, thermal_raw, thermal, digital_frame.shape[:2], face_track, alignment, state)
             draw_hud(heatmap, thermal, state, fps_smooth, contrast_range, recorder)
+
+            if digital_frame is not None and args.show_digital_debug:
+                cv2.imshow("TC001 Plus Digital Face Debug", draw_digital_debug(digital_frame, face_track, alignment, args.digital_source, args.digital_rotate))
 
             if state.recording and recorder.writer is not None:
                 out = heatmap
@@ -1395,6 +1719,8 @@ def main() -> int:
             stop_recording(recorder)
         if cap is not None:
             cap.release()
+        if digital_cap is not None:
+            digital_cap.release()
         if sdk_cam is not None:
             sdk_cam.close()
         cv2.destroyAllWindows()

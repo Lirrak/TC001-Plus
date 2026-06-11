@@ -20,3 +20,6 @@ dist/
 .env
 .env.*
 
+# Local camera calibration, depends on physical mounting/alignment.
+tc001_alignment.json
+
