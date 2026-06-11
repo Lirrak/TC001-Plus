@@ -732,7 +732,8 @@ def draw_face_overlay(
     pts_i = np.round(draw_pts).astype(np.int32).reshape(-1, 1, 2)
 
     cv2.polylines(img, [pts_i], isClosed=True, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
-    label = f"FACE {track.box.confidence * 100:.0f}%"
+    status = track.status if track.status and track.status != "NO FACE" else "FACE"
+    label = f"{status} {track.box.confidence * 100:.0f}%"
     face_temp_c = polygon_max_temperature_c(raw_thermal.temp_c, mapped)
     if face_temp_c is not None:
         label += f" | max {fmt_temp(face_temp_c, state.unit, raw_thermal.approx_temps)}"
@@ -746,8 +747,12 @@ def draw_digital_debug(frame: np.ndarray, track: FaceTrack, alignment: Alignment
     if track.box is not None:
         x0, y0 = int(track.box.x), int(track.box.y)
         x1, y1 = int(track.box.x + track.box.w), int(track.box.y + track.box.h)
-        cv2.rectangle(out, (x0, y0), (x1, y1), (0, 255, 0), 2, cv2.LINE_AA)
-        put_text(out, f"{track.detector_name} {track.box.confidence * 100:.0f}%", (x0, max(20, y0 - 8)), scale=0.5, color=(0, 255, 0))
+        color = (0, 200, 255) if track.status == "HELD" else (0, 255, 0)
+        cv2.rectangle(out, (x0, y0), (x1, y1), color, 2, cv2.LINE_AA)
+        label = f"{track.status} {track.box.confidence * 100:.0f}%"
+        if track.detector_name and track.detector_name not in ("none", "held"):
+            label += f" ({track.detector_name})"
+        put_text(out, label, (x0, max(20, y0 - 8)), scale=0.5, color=color)
     else:
         put_text(out, "NO FACE", (8, 24), scale=0.55, color=(0, 255, 255))
     put_text(out, f"Digital source: {source} | rotate {rotate} | {out.shape[1]}x{out.shape[0]} | alignment: {alignment.mode}", (8, out.shape[0] - 12), scale=0.42)

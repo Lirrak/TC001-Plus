@@ -80,6 +80,19 @@ digital that, thu fallback OpenCV/MSMF:
 Frame digital duoc xoay rieng bang `--digital-rotate 90` theo mac dinh. Neu anh
 bi xoay nguoc huong, thu `--digital-rotate 270`.
 
+Face/head detection hien tai dung nhieu tang:
+
+- `FACE`: detect mat chinh dien bang MediaPipe hoac Haar frontal.
+- `PROFILE`: detect mat nghieng bang profile cascade.
+- `HEAD TRACK`: fallback theo vung dau/than tren sang trong anh `sdk-top`.
+- `HELD`: tam giu box cu khi mat detector miss trong vai frame.
+- `NO FACE`: chua co box hop le.
+
+Voi nguon `sdk-top`, anh digital co the la grayscale/IR-like, khong phai RGB
+webcam binh thuong. Mat nghieng, deo kinh den, bi cat mat hoac qua toi/sang deu
+co the lam detector mat chinh dien miss, nen fallback `PROFILE` va `HEAD TRACK`
+duoc dung de tracking dau on dinh hon.
+
 ```powershell
 py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --digital-source opencv --digital-backend msmf --digital-device 1 --digital-split right --show-digital-debug
 ```
@@ -111,7 +124,9 @@ py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug
 
 - Neu debug khong hien anh digital that voi `sdk-top`, thu fallback OpenCV/MSMF.
 - Neu debug co anh mat nhung hien `NO FACE`, detector dang khong nhan mat trong
-  frame do. Hay nhin thang camera, tranh bi cat mat/qua toi/qua nghieng.
+  frame do. Hay kiem tra huong xoay `--digital-rotate`, anh co bi cat dau/mat
+  khong, va thu nhin thang camera de xac nhan nhanh. Sau ban moi, mat nghieng
+  co the hien `PROFILE` hoac `HEAD TRACK` thay vi `NO FACE`.
 - Neu co bbox tren debug nhung bbox tren thermal bi lech, can chay calibration
   4 diem de tao `tc001_alignment.json`.
 
@@ -212,7 +227,8 @@ Trang thai hien tai:
 - `--digital-device 1`: mac dinh, khong dung webcam camera0.
 - `--digital-split right`: lay nua phai cua frame ghep lam anh digital.
 - Label `FACE xx% | max yy.y degC`: hien thi nhiet do cao nhat trong vung face
-  ROI da map sang ma tran nhiet.
+  ROI da map sang ma tran nhiet. Label co the la `FACE`, `PROFILE`,
+  `HEAD TRACK` hoac `HELD` tuy detector dang dung.
 - `--calibrate-alignment`: click 4 diem digital/thermal de luu homography.
 - `--alignment-file tc001_alignment.json`: file map digital -> thermal.
 - `--alignment simple-scale`: mapping tam thoi khi chua calibration.
