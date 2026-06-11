@@ -22,18 +22,23 @@ class FaceBox:
 class FaceTrack:
     track_id: int = 0
     box: Optional[FaceBox] = None
+    first_seen_frame: int = 0
     last_seen_frame: int = 0
     detector_name: str = "none"
+    last_detector_source: str = "none"
     status: str = "NO FACE"
     missed_frames: int = 0
     hits: int = 0
     confirmed: bool = False
+    merged_from: Optional[int] = None
+    last_iou_with_existing: float = 0.0
 
 
 @dataclass
 class FaceTracker:
     tracks: list[FaceTrack] = field(default_factory=list)
     next_track_id: int = 1
+    last_stats: dict = field(default_factory=dict)
 
     def active_tracks(
         self,
@@ -50,16 +55,46 @@ class FaceTracker:
 
 
 class DigitalFaceDetector:
-    def __init__(self, model: str = "auto", min_confidence: float = 0.55) -> None:
+    def __init__(
+        self,
+        model: str = "auto",
+        min_confidence: float = 0.55,
+        task_model_path: Optional[str] = None,
+    ) -> None:
         self.requested_model = model
         self.min_confidence = float(min_confidence)
         self.name = "none"
+        self._mp_task_detector = None
+        self._mp_image_cls = None
+        self._mp_image_format = None
+        self._task_timestamp_ms = 0
         self._mp_detector = None
         self._haar_frontal = None
         self._haar_profile = None
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-        if model in ("auto", "mediapipe"):
+        if model in ("auto", "tasks") and task_model_path:
+            try:
+                import mediapipe as mp  # type: ignore
+                from mediapipe.tasks import python as mp_tasks_python  # type: ignore
+                from mediapipe.tasks.python import vision as mp_tasks_vision  # type: ignore
+
+                base_options = mp_tasks_python.BaseOptions(model_asset_path=task_model_path)
+                options = mp_tasks_vision.FaceDetectorOptions(
+                    base_options=base_options,
+                    running_mode=mp_tasks_vision.RunningMode.VIDEO,
+                    min_detection_confidence=self.min_confidence,
+                )
+                self._mp_task_detector = mp_tasks_vision.FaceDetector.create_from_options(options)
+                self._mp_image_cls = mp.Image
+                self._mp_image_format = mp.ImageFormat.SRGB
+            except Exception as exc:
+                if model == "tasks":
+                    print(f"WARNING: MediaPipe Tasks face detector unavailable: {exc}")
+        elif model == "tasks" and not task_model_path:
+            print("WARNING: --face-model tasks requires --face-task-model pointing to a .tflite face detector model.")
+
+        if self._mp_task_detector is None and model in ("auto", "mediapipe"):
             try:
                 import mediapipe as mp  # type: ignore
 
@@ -71,13 +106,15 @@ class DigitalFaceDetector:
                 if model == "mediapipe":
                     print(f"WARNING: MediaPipe face detector unavailable: {exc}")
 
-        if model in ("auto", "mediapipe", "haar"):
+        if model in ("auto", "tasks", "mediapipe", "haar"):
             frontal_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
             profile_path = os.path.join(cv2.data.haarcascades, "haarcascade_profileface.xml")
             self._haar_frontal = self._load_cascade(frontal_path, "frontal Haar")
             self._haar_profile = self._load_cascade(profile_path, "profile Haar")
 
         available = []
+        if self._mp_task_detector is not None:
+            available.append("tasks")
         if self._mp_detector is not None:
             available.append("mediapipe")
         if self._haar_frontal is not None:
@@ -106,8 +143,9 @@ class DigitalFaceDetector:
         self,
         frame_bgr: np.ndarray,
         max_faces: int = 5,
-        head_fallback: str = "auto",
+        head_fallback: str = "off",
         min_head_confidence: float = 0.65,
+        cascade_fallback: str = "auto",
     ) -> list[FaceBox]:
         if frame_bgr is None or frame_bgr.size == 0:
             return []
@@ -115,14 +153,24 @@ class DigitalFaceDetector:
         prepared_bgr, gray = self._preprocess(frame_bgr)
         primary_candidates: list[FaceBox] = []
 
-        if self._mp_detector is not None:
-            primary_candidates.extend(self._detect_mediapipe_all(frame_bgr if frame_bgr.ndim == 3 else prepared_bgr))
-            primary_candidates.extend(self._detect_mediapipe_all(prepared_bgr))
+        model_candidates: list[FaceBox] = []
+        if self._mp_task_detector is not None:
+            model_candidates.extend(self._detect_mediapipe_tasks_all(frame_bgr if frame_bgr.ndim == 3 else prepared_bgr))
+            if not model_candidates:
+                model_candidates.extend(self._detect_mediapipe_tasks_all(prepared_bgr))
 
-        if self._haar_frontal is not None:
+        if self._mp_detector is not None:
+            model_candidates.extend(self._detect_mediapipe_all(frame_bgr if frame_bgr.ndim == 3 else prepared_bgr))
+            model_candidates.extend(self._detect_mediapipe_all(prepared_bgr))
+
+        primary_candidates.extend(model_candidates)
+        cascade_fallback = (cascade_fallback or "auto").lower()
+        use_cascade = cascade_fallback == "always" or (cascade_fallback == "auto" and not model_candidates)
+
+        if use_cascade and self._haar_frontal is not None:
             primary_candidates.extend(self._detect_haar_all(gray, self._haar_frontal, "haar", 0.80, min_neighbors=4))
 
-        if self._haar_profile is not None:
+        if use_cascade and self._haar_profile is not None:
             primary_candidates.extend(self._detect_profile_all(gray))
 
         max_faces = max(1, int(max_faces))
@@ -157,6 +205,35 @@ class DigitalFaceDetector:
         gray = cv2.medianBlur(gray, 3)
         prepared_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         return prepared_bgr, gray
+
+    def _detect_mediapipe_tasks_all(self, frame_bgr: np.ndarray) -> list[FaceBox]:
+        if self._mp_task_detector is None or self._mp_image_cls is None or self._mp_image_format is None:
+            return []
+        h, w = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        image = self._mp_image_cls(image_format=self._mp_image_format, data=np.ascontiguousarray(rgb))
+        self._task_timestamp_ms += 40
+        result = self._mp_task_detector.detect_for_video(image, self._task_timestamp_ms)
+        detections = result.detections if result and result.detections else []
+        boxes: list[FaceBox] = []
+        for det in detections:
+            score = 0.0
+            categories = getattr(det, "categories", None)
+            if categories:
+                score = float(categories[0].score)
+            if score < self.min_confidence:
+                continue
+            bbox = det.bounding_box
+            box = FaceBox(
+                x=float(bbox.origin_x),
+                y=float(bbox.origin_y),
+                w=max(1.0, float(bbox.width)),
+                h=max(1.0, float(bbox.height)),
+                confidence=score,
+                source="tasks",
+            )
+            boxes.append(self._clip_box(box, w, h))
+        return boxes
 
     def _detect_mediapipe_all(self, frame_bgr: np.ndarray) -> list[FaceBox]:
         h, w = frame_bgr.shape[:2]
@@ -269,7 +346,7 @@ class DigitalFaceDetector:
             return []
 
         def score(box: FaceBox) -> tuple[float, float, float]:
-            priority = {"mediapipe": 3.0, "haar": 2.0, "profile": 1.5, "head": 1.0}.get(box.source, 0.0)
+            priority = {"tasks": 3.5, "mediapipe": 3.0, "haar": 2.0, "profile": 1.5, "head": 1.0}.get(box.source, 0.0)
             area = box.w * box.h
             return priority, box.confidence, area
 
@@ -296,7 +373,7 @@ def face_status_from_source(source: str, held: bool = False) -> str:
         return "PROFILE"
     if source == "head":
         return "HEAD TRACK"
-    if source in ("mediapipe", "haar"):
+    if source in ("tasks", "mediapipe", "haar"):
         return "FACE"
     return source.upper() if source else "NO FACE"
 
@@ -304,7 +381,60 @@ def face_status_from_source(source: str, held: bool = False) -> str:
 def required_hits_for_source(source: str, head_confirm_frames: int) -> int:
     if source == "head":
         return max(1, int(head_confirm_frames))
+    if source in ("haar", "profile"):
+        return 2
     return 1
+
+
+def required_hits(source: str, min_face_hits: int, head_confirm_frames: int) -> int:
+    if source == "head":
+        return max(1, int(head_confirm_frames))
+    if source in ("haar", "profile"):
+        return max(1, int(min_face_hits))
+    return 1
+
+
+def area_ratio(box: FaceBox, frame_shape: tuple[int, int]) -> float:
+    frame_h, frame_w = frame_shape[:2]
+    return float((box.w * box.h) / max(float(frame_w * frame_h), 1.0))
+
+
+def filter_detection_boxes(
+    boxes: list[FaceBox],
+    frame_shape: tuple[int, int],
+    max_face_area_ratio: float,
+) -> tuple[list[FaceBox], list[dict]]:
+    frame_h, frame_w = frame_shape[:2]
+    max_face_area_ratio = max(0.01, float(max_face_area_ratio))
+    kept: list[FaceBox] = []
+    rejected: list[dict] = []
+    for box in boxes:
+        reasons = []
+        ratio = area_ratio(box, frame_shape)
+        if ratio > max_face_area_ratio:
+            reasons.append("area")
+        if box.w > frame_w * 0.55 or box.h > frame_h * 0.55:
+            reasons.append("size")
+        if box.w < frame_w * 0.08 or box.h < frame_h * 0.08:
+            reasons.append("small")
+        aspect = box.w / max(box.h, 1.0)
+        if not 0.45 <= aspect <= 1.55:
+            reasons.append("aspect")
+        touches_edge = box.x <= 1 or box.y <= 1 or box.x + box.w >= frame_w - 1 or box.y + box.h >= frame_h - 1
+        if touches_edge and box.confidence < 0.85:
+            reasons.append("edge")
+        if reasons:
+            rejected.append(
+                {
+                    "source": box.source,
+                    "bbox": [round(float(box.x), 2), round(float(box.y), 2), round(float(box.w), 2), round(float(box.h), 2)],
+                    "area_ratio": round(ratio, 4),
+                    "reasons": reasons,
+                }
+            )
+        else:
+            kept.append(box)
+    return kept, rejected
 
 
 def box_iou(a: FaceBox, b: FaceBox) -> float:
@@ -355,9 +485,13 @@ def update_face_tracks(
     hold_frames: int,
     smoothing: float,
     max_faces: int,
-    head_fallback: str = "auto",
+    head_fallback: str = "off",
     head_confirm_frames: int = 2,
     min_head_confidence: float = 0.65,
+    min_face_hits: int = 2,
+    max_face_area_ratio: float = 0.20,
+    max_box_overlap: float = 0.30,
+    cascade_fallback: str = "auto",
 ) -> FaceTracker:
     max_faces = max(1, int(max_faces))
     should_detect = not tracker.tracks or frame_index % max(1, detect_interval) == 0
@@ -367,10 +501,24 @@ def update_face_tracks(
             max_faces=max_faces,
             head_fallback=head_fallback,
             min_head_confidence=min_head_confidence,
+            cascade_fallback=cascade_fallback,
         )
         if should_detect
         else []
     )
+    rejected: list[dict] = []
+    if should_detect:
+        detections, rejected = filter_detection_boxes(detections, digital_frame.shape[:2], max_face_area_ratio)
+    stats = {
+        "frame_index": int(frame_index),
+        "raw_detections": int(len(detections) + len(rejected)),
+        "kept_detections": int(len(detections)),
+        "rejected_detections": int(len(rejected)),
+        "rejected": rejected,
+        "merged_detections": 0,
+        "duplicate_suppressed": 0,
+        "new_tracks": 0,
+    }
     unmatched_detection_indexes = set(range(len(detections)))
 
     for track in tracker.tracks:
@@ -392,10 +540,12 @@ def update_face_tracks(
             track.box = smooth_box(track.box, new_box, smoothing)
             track.last_seen_frame = frame_index
             track.detector_name = new_box.source
+            track.last_detector_source = new_box.source
             track.status = face_status_from_source(new_box.source)
             track.hits += 1
-            track.confirmed = track.confirmed or track.hits >= required_hits_for_source(new_box.source, head_confirm_frames)
+            track.confirmed = track.confirmed or track.hits >= required_hits(new_box.source, min_face_hits, head_confirm_frames)
             track.missed_frames = 0
+            track.last_iou_with_existing = float(best_score)
             unmatched_detection_indexes.remove(best_index)
         elif track.confirmed and frame_index - track.last_seen_frame <= hold_frames:
             track.missed_frames += 1
@@ -417,30 +567,65 @@ def update_face_tracks(
     if should_detect:
         current_count = len([track for track in tracker.tracks if track.confirmed])
         for index in sorted(unmatched_detection_indexes, key=lambda idx: detections[idx].confidence, reverse=True):
-            if current_count >= max_faces:
-                break
             box = detections[index]
+            overlap_track = None
+            overlap_score = 0.0
+            for track in tracker.tracks:
+                if track.box is None:
+                    continue
+                score = max(box_iou(track.box, box), match_score(track, box))
+                if score > overlap_score:
+                    overlap_score = score
+                    overlap_track = track
+
+            if overlap_track is not None and overlap_score >= float(max_box_overlap):
+                if overlap_track.last_seen_frame == frame_index:
+                    stats["duplicate_suppressed"] += 1
+                elif overlap_track.confirmed:
+                    overlap_track.box = smooth_box(overlap_track.box, box, smoothing)
+                    overlap_track.last_seen_frame = frame_index
+                    overlap_track.detector_name = box.source
+                    overlap_track.last_detector_source = box.source
+                    overlap_track.status = face_status_from_source(box.source)
+                    overlap_track.hits += 1
+                    overlap_track.missed_frames = 0
+                    overlap_track.last_iou_with_existing = float(overlap_score)
+                    overlap_track.merged_from = None
+                    stats["merged_detections"] += 1
+                else:
+                    stats["duplicate_suppressed"] += 1
+                continue
+
+            if current_count >= max_faces:
+                stats["duplicate_suppressed"] += 1
+                continue
+
             hits = 1
-            confirmed = hits >= required_hits_for_source(box.source, head_confirm_frames)
+            confirmed = hits >= required_hits(box.source, min_face_hits, head_confirm_frames)
             tracker.tracks.append(
                 FaceTrack(
                     track_id=tracker.next_track_id,
                     box=box,
+                    first_seen_frame=frame_index,
                     last_seen_frame=frame_index,
                     detector_name=box.source,
+                    last_detector_source=box.source,
                     status=face_status_from_source(box.source),
                     missed_frames=0,
                     hits=hits,
                     confirmed=confirmed,
+                    last_iou_with_existing=0.0,
                 )
             )
             tracker.next_track_id += 1
+            stats["new_tracks"] += 1
             if confirmed:
                 current_count += 1
 
     confirmed_tracks = tracker.active_tracks(confirmed_only=True)
     candidate_tracks = [track for track in tracker.active_tracks() if not track.confirmed]
     tracker.tracks = confirmed_tracks[:max_faces] + candidate_tracks[:max_faces]
+    tracker.last_stats = stats
     return tracker
 
 

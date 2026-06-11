@@ -93,10 +93,10 @@ Viewer ho tro nhieu nguoi trong cung khung hinh. Moi nguoi duoc gan nhan `P1`,
 `P2`, ... va co box/nhiet do ROI rieng. So nguoi hien thi toi da mac dinh la 5,
 co the doi bang `--max-faces`.
 
-De giam nhieu ROI, `HEAD TRACK` mac dinh chay o che do `--head-fallback auto`.
+De giam nhieu ROI, `HEAD TRACK` mac dinh dang tat (`--head-fallback off`).
 Fallback nay de bat mat nghieng/anh xam kho detect, nhung de nhiem hon `FACE`
-va `PROFILE`, nen box head phai du on dinh qua `--head-confirm-frames` truoc khi
-hien tren thermal view.
+va `PROFILE`, nen chi nen bat lai bang `--head-fallback auto` khi can. Box head
+phai du on dinh qua `--head-confirm-frames` truoc khi hien tren thermal view.
 
 Voi nguon `sdk-top`, anh digital co the la grayscale/IR-like, khong phai RGB
 webcam binh thuong. Mat nghieng, deo kinh den, bi cat mat hoac qua toi/sang deu
@@ -141,13 +141,31 @@ py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --m
 Lenh khuyen nghi khi can giam nhieu box ROI:
 
 ```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback auto
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback off --cascade-fallback auto --min-face-hits 2 --max-face-area-ratio 0.20 --debug-detections
 ```
 
-Neu van bi nhieu tu `HEAD TRACK`, tat fallback nay de chi dung face/profile:
+Luu log JSONL de xem data bbox/ROI/nhiet do tra ra:
 
 ```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback off
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback off --debug-detections --save-detection-debug detections_debug.jsonl
+```
+
+Doc report tu file JSONL:
+
+```powershell
+py .\tools\analyze_detections.py .\detections_debug.jsonl
+```
+
+Neu can thu bat mat nghieng bang fallback head:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback auto --head-confirm-frames 3
+```
+
+Neu co file MediaPipe Tasks face detector `.tflite`, co the dung backend AI moi:
+
+```powershell
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --face-model tasks --face-task-model .\models\face_detector.tflite --show-digital-debug --max-faces 2
 ```
 
 - Neu debug khong hien anh digital that voi `sdk-top`, thu fallback OpenCV/MSMF.
@@ -255,9 +273,18 @@ Trang thai hien tai:
 - `--digital-device 1`: mac dinh, khong dung webcam camera0.
 - `--digital-split right`: lay nua phai cua frame ghep lam anh digital.
 - `--max-faces 5`: so nguoi/face tracks toi da hien thi.
-- `--head-fallback auto`: bat/tat fallback head de giam nhieu ROI.
+- `--head-fallback off`: mac dinh tat fallback head de giam nhieu ROI.
 - `--head-confirm-frames 2`: so frame detect can co truoc khi `HEAD TRACK`
   duoc ve len thermal view.
+- `--cascade-fallback auto`: Haar/profile chi la fallback, khong phai model tin
+  cay cao tren anh `sdk-top`.
+- `--min-face-hits 2`: Haar/profile can lap lai nhieu frame truoc khi ve thermal.
+- `--max-face-area-ratio 0.20`: reject box qua lon de tranh ROI phu vai/nguc/nen.
+- `--max-box-overlap 0.30`: merge/suppress box moi neu trung track cu.
+- `--debug-detections`: in data bbox/ROI/nhiet do ra console.
+- `--save-detection-debug detections_debug.jsonl`: luu data audit dang JSONL.
+- `--face-model tasks --face-task-model ...`: dung MediaPipe Tasks face detector
+  neu da co model `.tflite`.
 - Label `P1 FACE xx% | max yy.y degC`: hien thi nhiet do cao nhat trong ROI
   tung nguoi da map sang ma tran nhiet. Label co the la `FACE`, `PROFILE`,
   `HEAD TRACK` hoac `HELD` tuy detector dang dung.
@@ -267,8 +294,10 @@ Trang thai hien tai:
 
 AI co the dung:
 
+- MediaPipe Tasks Face Detector de detect nhieu mat on dinh hon khi co model
+  `.tflite`.
 - MediaPipe Face Landmarker de detect mat va vung tran.
-- YOLO11n/YOLO11s de detect vat the co rui ro nhu o dien, adapter, day dien,
+-  11n/YOLO11s de detect vat the co rui ro nhu o dien, adapter, day dien,
   pin, o cam keo dai.
 
 Vung detect tren RGB can duoc map sang ma tran nhiet bang calibration 4 diem thu

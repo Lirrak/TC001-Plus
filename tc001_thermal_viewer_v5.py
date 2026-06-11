@@ -758,6 +758,10 @@ def draw_face_overlay(
 def draw_digital_debug(frame: np.ndarray, tracker: FaceTracker, alignment: Alignment, source: str, rotate: int) -> np.ndarray:
     out = frame.copy()
     tracks = tracker.active_tracks()
+    confirmed_count = len([track for track in tracks if track.confirmed])
+    candidate_count = len(tracks) - confirmed_count
+    head_count = len([track for track in tracks if track.detector_name == "head"])
+    face_count = len([track for track in tracks if track.detector_name in ("tasks", "mediapipe", "haar", "profile")])
     if tracks:
         for track in tracks:
             if track.box is None:
@@ -778,8 +782,85 @@ def draw_digital_debug(frame: np.ndarray, tracker: FaceTracker, alignment: Align
             put_text(out, label, (x0, max(20, y0 - 8)), scale=0.5, color=color)
     else:
         put_text(out, "NO FACE", (8, 24), scale=0.55, color=(0, 255, 255))
+    put_text(
+        out,
+        f"confirmed {confirmed_count} | candidate {candidate_count} | face {face_count} | head {head_count}",
+        (8, 48 if not tracks else 24),
+        scale=0.42,
+        color=(0, 255, 255),
+    )
     put_text(out, f"Digital source: {source} | rotate {rotate} | {out.shape[1]}x{out.shape[0]} | alignment: {alignment.mode}", (8, out.shape[0] - 12), scale=0.42)
     return out
+
+
+def build_detection_debug_record(
+    frame_index: int,
+    digital_shape: Tuple[int, int],
+    tracker: FaceTracker,
+    raw_thermal: ThermalFrame,
+    alignment: Alignment,
+) -> dict:
+    raw_thermal_shape = raw_thermal.temp_c.shape[:2] if raw_thermal.temp_c is not None else raw_thermal.display_source.shape[:2]
+    tracks = []
+    for track in tracker.active_tracks():
+        if track.box is None:
+            continue
+        mapped = map_points_to_thermal(face_box_points(track.box), digital_shape, raw_thermal_shape, alignment)
+        max_temp_c = polygon_max_temperature_c(raw_thermal.temp_c, mapped) if mapped is not None else None
+        tracks.append(
+            {
+                "track_id": int(track.track_id),
+                "source": track.detector_name,
+                "last_detector_source": track.last_detector_source,
+                "status": track.status,
+                "confirmed": bool(track.confirmed),
+                "hits": int(track.hits),
+                "missed_frames": int(track.missed_frames),
+                "age_frames": int(frame_index - track.first_seen_frame) if track.first_seen_frame else 0,
+                "confidence": float(track.box.confidence),
+                "bbox": [
+                    round(float(track.box.x), 2),
+                    round(float(track.box.y), 2),
+                    round(float(track.box.w), 2),
+                    round(float(track.box.h), 2),
+                ],
+                "area_ratio": round(float((track.box.w * track.box.h) / max(float(digital_shape[0] * digital_shape[1]), 1.0)), 4),
+                "iou_with_existing": round(float(track.last_iou_with_existing), 4),
+                "merged_from": track.merged_from,
+                "thermal_polygon": None
+                if mapped is None
+                else [[round(float(x), 2), round(float(y), 2)] for x, y in mapped.tolist()],
+                "max_temp_c": None if max_temp_c is None else round(float(max_temp_c), 2),
+            }
+        )
+    return {
+        "frame_index": int(frame_index),
+        "digital_size": [int(digital_shape[1]), int(digital_shape[0])],
+        "alignment": alignment.mode,
+        "summary": tracker.last_stats,
+        "tracks": tracks,
+    }
+
+
+def emit_detection_debug(record: dict, debug_console: bool, debug_file: Optional[Any]) -> None:
+    if debug_console:
+        brief = [
+            f"P{track['track_id']}:{track['source']}:{track['last_detector_source']}:{track['status']}:"
+            f"{'ok' if track['confirmed'] else 'cand'}:"
+            f"bbox={track['bbox']}:max={track['max_temp_c']}"
+            for track in record.get("tracks", [])
+        ]
+        summary = record.get("summary", {}) or {}
+        stats = (
+            f"new={summary.get('new_tracks', 0)} "
+            f"merge={summary.get('merged_detections', 0)} "
+            f"suppress={summary.get('duplicate_suppressed', 0)} "
+            f"reject={summary.get('rejected_detections', 0)}"
+        )
+        print(f"[detections frame={record['frame_index']} {stats}] " + (" | ".join(brief) if brief else "none"))
+    if debug_file is not None:
+        debug_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        debug_file.flush()
 
 
 def collect_four_points(window: str, image: np.ndarray, title: str) -> List[Tuple[float, float]]:
@@ -1421,15 +1502,23 @@ def parse_args() -> argparse.Namespace:
         help="Directory containing TOPDON libiruvc.dll. Default: TopView dll_c001p folder.",
     )
     parser.add_argument("--face-detect", action="store_true", help="Detect faces on the TC001 Plus digital camera stream and map the box to SDK thermal frames.")
-    parser.add_argument("--face-model", choices=["auto", "mediapipe", "haar"], default="auto", help="Face detector backend. Default: auto.")
+    parser.add_argument("--face-model", choices=["auto", "tasks", "mediapipe", "haar"], default="auto", help="Face detector backend. Default: auto.")
+    parser.add_argument("--face-task-model", default=None, help="Optional MediaPipe Tasks face detector .tflite model path.")
     parser.add_argument("--face-min-confidence", type=float, default=0.55, help="Minimum MediaPipe face confidence. Default: 0.55.")
     parser.add_argument("--face-detect-interval", type=int, default=3, help="Run face detection every N frames, then track/smooth between detections. Default: 3.")
     parser.add_argument("--face-hold-frames", type=int, default=15, help="Keep the last face box for this many frames after missed detections. Default: 15.")
     parser.add_argument("--face-smoothing", type=float, default=0.65, help="EMA smoothing for face box coordinates. Default: 0.65.")
+    parser.add_argument("--min-face-hits", type=int, default=2, help="Detection hits required before Haar/profile tracks are shown. Default: 2.")
+    parser.add_argument("--max-face-area-ratio", type=float, default=0.20, help="Reject face boxes larger than this frame area ratio. Default: 0.20.")
+    parser.add_argument("--max-box-overlap", type=float, default=0.30, help="Merge/suppress new boxes overlapping existing tracks above this score. Default: 0.30.")
+    parser.add_argument("--cascade-fallback", choices=["off", "auto", "always"], default="auto", help="Use Haar/profile cascade fallback. Default: auto.")
     parser.add_argument("--max-faces", type=int, default=5, help="Maximum number of people/face tracks to show. Default: 5.")
-    parser.add_argument("--head-fallback", choices=["off", "auto", "always"], default="auto", help="Use thermal/bright-region head fallback. Default: auto.")
+    parser.add_argument("--head-fallback", choices=["off", "auto", "always"], default="off", help="Use thermal/bright-region head fallback. Default: off for stable ROI.")
     parser.add_argument("--head-confirm-frames", type=int, default=2, help="Detection frames required before showing a HEAD TRACK on thermal view. Default: 2.")
     parser.add_argument("--min-head-confidence", type=float, default=0.65, help="Assigned confidence for accepted head fallback boxes. Default: 0.65.")
+    parser.add_argument("--debug-detections", action="store_true", help="Print face/ROI detection data every --debug-detections-every frames.")
+    parser.add_argument("--debug-detections-every", type=int, default=15, help="Frame interval for --debug-detections and --save-detection-debug. Default: 15.")
+    parser.add_argument("--save-detection-debug", default=None, help="Append face/ROI detection debug records as JSONL to this file.")
     parser.add_argument("--digital-source", choices=["sdk-top", "opencv"], default="sdk-top", help="Digital/visual source for AI. Default: sdk-top.")
     parser.add_argument("--digital-device", type=int, default=1, help="OpenCV digital/visual device for TC001 Plus AI. Default: 1.")
     parser.add_argument("--digital-backend", choices=["auto", "msmf", "dshow", "any"], default="msmf", help="OpenCV backend used only for --digital-source opencv. Default: msmf.")
@@ -1505,6 +1594,7 @@ def main() -> int:
     sdk_cam: Optional[TC001SdkCamera] = None
     face_detector: Optional[DigitalFaceDetector] = None
     face_tracker = FaceTracker()
+    detection_debug_file = None
     alignment = load_alignment(args.alignment_file, args.alignment)
 
     if args.sdk_raw:
@@ -1562,11 +1652,12 @@ def main() -> int:
         print("Using SDK top-half preview as the AI digital source. OpenCV camera1 is not opened for AI.")
 
     if args.face_detect:
-        face_detector = DigitalFaceDetector(args.face_model, args.face_min_confidence)
+        face_detector = DigitalFaceDetector(args.face_model, args.face_min_confidence, args.face_task_model)
         print(
             f"Face detection enabled: detector={face_detector.name}, "
             f"digital_source={args.digital_source}, alignment={alignment.mode}, "
-            f"max_faces={args.max_faces}, head_fallback={args.head_fallback}."
+            f"max_faces={args.max_faces}, head_fallback={args.head_fallback}, "
+            f"cascade_fallback={args.cascade_fallback}, min_face_hits={args.min_face_hits}."
         )
 
     if args.calibrate_alignment:
@@ -1652,6 +1743,10 @@ def main() -> int:
 
     print_controls()
 
+    if args.save_detection_debug:
+        detection_debug_file = open(args.save_detection_debug, "a", encoding="utf-8")
+        print(f"Saving detection debug JSONL to: {os.path.abspath(args.save_detection_debug)}")
+
     fps_smooth = 0.0
     last_time = time.time()
     read_failures = 0
@@ -1710,6 +1805,10 @@ def main() -> int:
                         args.head_fallback,
                         args.head_confirm_frames,
                         args.min_head_confidence,
+                        args.min_face_hits,
+                        args.max_face_area_ratio,
+                        args.max_box_overlap,
+                        args.cascade_fallback,
                     )
 
             if sdk_cam is not None and temp_c is not None:
@@ -1733,6 +1832,17 @@ def main() -> int:
             heatmap, contrast_range = make_heatmap(thermal.display_source, state)
             heatmap = resize_to_window(heatmap, state.fit_window)
             if digital_frame is not None and args.face_detect:
+                if args.debug_detections or detection_debug_file is not None:
+                    every = max(1, int(args.debug_detections_every))
+                    if frame_index % every == 0:
+                        record = build_detection_debug_record(
+                            frame_index,
+                            digital_frame.shape[:2],
+                            face_tracker,
+                            thermal_raw,
+                            alignment,
+                        )
+                        emit_detection_debug(record, bool(args.debug_detections), detection_debug_file)
                 draw_face_overlay(heatmap, thermal_raw, thermal, digital_frame.shape[:2], face_tracker, alignment, state)
             draw_hud(heatmap, thermal, state, fps_smooth, contrast_range, recorder)
 
@@ -1761,6 +1871,8 @@ def main() -> int:
             cap.release()
         if digital_cap is not None:
             digital_cap.release()
+        if detection_debug_file is not None:
+            detection_debug_file.close()
         if sdk_cam is not None:
             sdk_cam.close()
         cv2.destroyAllWindows()
