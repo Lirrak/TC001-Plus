@@ -7,6 +7,9 @@ from typing import Optional
 import cv2
 import numpy as np
 
+SAME_TRACK_THRESHOLD = 0.18
+REID_TRACK_THRESHOLD = 0.16
+
 
 @dataclass
 class FaceBox:
@@ -37,6 +40,7 @@ class FaceTrack:
 @dataclass
 class FaceTracker:
     tracks: list[FaceTrack] = field(default_factory=list)
+    retired_tracks: list[FaceTrack] = field(default_factory=list)
     next_track_id: int = 1
     last_stats: dict = field(default_factory=dict)
 
@@ -72,6 +76,7 @@ class DigitalFaceDetector:
         self._haar_frontal = None
         self._haar_profile = None
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        self.last_debug: dict = {}
 
         if model in ("auto", "tasks") and task_model_path:
             try:
@@ -143,14 +148,17 @@ class DigitalFaceDetector:
         self,
         frame_bgr: np.ndarray,
         max_faces: int = 5,
-        head_fallback: str = "off",
+        head_fallback: str = "auto",
         min_head_confidence: float = 0.65,
         cascade_fallback: str = "auto",
     ) -> list[FaceBox]:
         if frame_bgr is None or frame_bgr.size == 0:
+            self.last_debug = {"empty_frame": True}
             return []
 
         prepared_bgr, gray = self._preprocess(frame_bgr)
+        frame_h, frame_w = gray.shape[:2]
+        max_faces = max(1, int(max_faces))
         primary_candidates: list[FaceBox] = []
 
         model_candidates: list[FaceBox] = []
@@ -165,7 +173,7 @@ class DigitalFaceDetector:
 
         primary_candidates.extend(model_candidates)
         cascade_fallback = (cascade_fallback or "auto").lower()
-        use_cascade = cascade_fallback == "always" or (cascade_fallback == "auto" and not model_candidates)
+        use_cascade = cascade_fallback == "always" or (cascade_fallback == "auto" and len(model_candidates) < max_faces)
 
         if use_cascade and self._haar_frontal is not None:
             primary_candidates.extend(self._detect_haar_all(gray, self._haar_frontal, "haar", 0.80, min_neighbors=4))
@@ -173,19 +181,40 @@ class DigitalFaceDetector:
         if use_cascade and self._haar_profile is not None:
             primary_candidates.extend(self._detect_profile_all(gray))
 
-        max_faces = max(1, int(max_faces))
-        primary = self._nms(primary_candidates, iou_threshold=0.35, max_boxes=max_faces)
+        primary, primary_nms = self._nms_with_debug(primary_candidates, iou_threshold=0.35, max_boxes=max_faces)
         head_fallback = (head_fallback or "auto").lower()
         candidates = list(primary)
+        head_candidates: list[FaceBox] = []
 
         head_target = min(max_faces, 2)
         use_head = head_fallback == "always" or (head_fallback == "auto" and len(primary) < head_target)
         if use_head and head_fallback != "off":
-            heads = self._detect_head_all(gray, float(min_head_confidence))
-            heads = [head for head in heads if not self._is_near_primary(head, primary)]
+            head_candidates = self._detect_head_all(gray, float(min_head_confidence))
+            heads = [head for head in head_candidates if not self._is_near_primary(head, primary)]
             candidates.extend(heads)
 
-        return self._nms(candidates, iou_threshold=0.35, max_boxes=max_faces)
+        final, final_nms = self._nms_with_debug(candidates, iou_threshold=0.35, max_boxes=max_faces)
+        self.last_debug = {
+            "empty_frame": False,
+            "frame_size": [int(frame_w), int(frame_h)],
+            "max_faces": int(max_faces),
+            "cascade_fallback": cascade_fallback,
+            "cascade_used": bool(use_cascade),
+            "head_fallback": head_fallback,
+            "head_used": bool(use_head and head_fallback != "off"),
+            "model_candidates": int(len(model_candidates)),
+            "primary_candidates": int(len(primary_candidates)),
+            "primary_candidates_by_source": count_boxes_by_source(primary_candidates),
+            "primary_after_nms": int(len(primary)),
+            "primary_nms_suppressed": primary_nms,
+            "head_candidates": int(len(head_candidates)),
+            "final_candidates": int(len(candidates)),
+            "final_candidates_by_source": count_boxes_by_source(candidates),
+            "final_after_nms": int(len(final)),
+            "final_nms_suppressed": final_nms,
+            "final_boxes": [box_to_debug_dict(box, (frame_h, frame_w)) for box in final],
+        }
+        return final
 
     def _preprocess(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if frame_bgr.ndim == 2:
@@ -302,7 +331,7 @@ class DigitalFaceDetector:
             return []
 
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh_value = max(70.0, float(np.percentile(blurred, 72.0)))
+        thresh_value = max(64.0, float(np.percentile(blurred, 70.0)))
         _, mask = cv2.threshold(blurred, thresh_value, 255, cv2.THRESH_BINARY)
         kernel = np.ones((5, 5), dtype=np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -314,9 +343,14 @@ class DigitalFaceDetector:
         boxes: list[FaceBox] = []
         for contour in contours:
             area = float(cv2.contourArea(contour))
-            if area < min_area or area > max_area:
+            if area < min_area:
                 continue
             x, y, w, h = cv2.boundingRect(contour)
+            if y > frame_h * 0.72:
+                continue
+            if area > max_area or w > frame_w * 0.55 or h > frame_h * 0.58:
+                boxes.extend(self._detect_head_from_large_contour(mask, contour, confidence))
+                continue
             if w < frame_w * 0.14 or h < frame_h * 0.18:
                 continue
             if w > frame_w * 0.48 or h > frame_h * 0.55:
@@ -331,6 +365,49 @@ class DigitalFaceDetector:
             boxes.append(self._clip_box(FaceBox(float(x), float(y), float(w), float(head_h), confidence, "head"), frame_w, frame_h))
         return boxes
 
+    def _detect_head_from_large_contour(
+        self,
+        mask: np.ndarray,
+        contour: np.ndarray,
+        confidence: float,
+    ) -> list[FaceBox]:
+        frame_h, frame_w = mask.shape[:2]
+        x, y, w, h = cv2.boundingRect(contour)
+        if h < frame_h * 0.24 or w < frame_w * 0.16:
+            return []
+
+        component = np.zeros_like(mask)
+        cv2.drawContours(component, [contour], -1, 255, thickness=cv2.FILLED)
+        upper_h = min(h, max(int(h * 0.52), int(frame_h * 0.26)))
+        upper = component[y : y + upper_h, x : x + w]
+        if upper.size == 0:
+            return []
+
+        upper_contours, _hierarchy = cv2.findContours(upper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        candidates: list[FaceBox] = []
+        for upper_contour in upper_contours:
+            area = float(cv2.contourArea(upper_contour))
+            if area < frame_w * frame_h * 0.018:
+                continue
+            ux, uy, uw, uh = cv2.boundingRect(upper_contour)
+            if uw < frame_w * 0.11 or uh < frame_h * 0.12:
+                continue
+            if y + uy > frame_h * 0.68:
+                continue
+
+            box_w = min(max(float(uw) * 1.18, frame_w * 0.16), frame_w * 0.44)
+            box_h = min(max(float(uh) * 1.10, box_w * 1.05, frame_h * 0.20), frame_h * 0.48)
+            cx = x + ux + uw * 0.5
+            by = y + uy - box_h * 0.08
+            bx = cx - box_w * 0.5
+            box = self._clip_box(FaceBox(float(bx), float(by), float(box_w), float(box_h), confidence, "head"), frame_w, frame_h)
+            ratio = area_ratio(box, (frame_h, frame_w))
+            aspect = box.w / max(box.h, 1.0)
+            if 0.035 <= ratio <= 0.20 and 0.45 <= aspect <= 1.45:
+                candidates.append(box)
+
+        return self._nms(candidates, iou_threshold=0.30, max_boxes=2)
+
     def _is_near_primary(self, head: FaceBox, primary_boxes: list[FaceBox]) -> bool:
         for primary in primary_boxes:
             if box_iou(head, primary) >= 0.15:
@@ -342,8 +419,17 @@ class DigitalFaceDetector:
         return False
 
     def _nms(self, boxes: list[FaceBox], iou_threshold: float, max_boxes: int) -> list[FaceBox]:
+        selected, _suppressed = self._nms_with_debug(boxes, iou_threshold, max_boxes)
+        return selected
+
+    def _nms_with_debug(
+        self,
+        boxes: list[FaceBox],
+        iou_threshold: float,
+        max_boxes: int,
+    ) -> tuple[list[FaceBox], list[dict]]:
         if not boxes:
-            return []
+            return [], []
 
         def score(box: FaceBox) -> tuple[float, float, float]:
             priority = {"tasks": 3.5, "mediapipe": 3.0, "haar": 2.0, "profile": 1.5, "head": 1.0}.get(box.source, 0.0)
@@ -351,12 +437,31 @@ class DigitalFaceDetector:
             return priority, box.confidence, area
 
         selected: list[FaceBox] = []
-        for box in sorted(boxes, key=score, reverse=True):
-            if all(box_iou(box, chosen) < iou_threshold for chosen in selected):
-                selected.append(box)
+        suppressed: list[dict] = []
+        ordered = sorted(boxes, key=score, reverse=True)
+        for index, box in enumerate(ordered):
             if len(selected) >= max_boxes:
-                break
-        return sorted(selected, key=lambda box: box.x)
+                suppressed.append({"reason": "max_faces", **box_to_debug_dict(box)})
+                continue
+            best_iou = 0.0
+            best_source = None
+            for chosen in selected:
+                overlap = box_iou(box, chosen)
+                if overlap > best_iou:
+                    best_iou = overlap
+                    best_source = chosen.source
+            if best_iou < iou_threshold:
+                selected.append(box)
+            else:
+                suppressed.append(
+                    {
+                        "reason": "nms",
+                        "iou": round(float(best_iou), 4),
+                        "matched_source": best_source,
+                        **box_to_debug_dict(box),
+                    }
+                )
+        return sorted(selected, key=lambda box: box.x), suppressed
 
     def _clip_box(self, box: FaceBox, frame_w: int, frame_h: int) -> FaceBox:
         x0 = min(max(float(box.x), 0.0), max(float(frame_w - 1), 0.0))
@@ -399,6 +504,24 @@ def area_ratio(box: FaceBox, frame_shape: tuple[int, int]) -> float:
     return float((box.w * box.h) / max(float(frame_w * frame_h), 1.0))
 
 
+def count_boxes_by_source(boxes: list[FaceBox]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for box in boxes:
+        counts[box.source] = counts.get(box.source, 0) + 1
+    return counts
+
+
+def box_to_debug_dict(box: FaceBox, frame_shape: Optional[tuple[int, int]] = None) -> dict:
+    data = {
+        "source": box.source,
+        "confidence": round(float(box.confidence), 4),
+        "bbox": [round(float(box.x), 2), round(float(box.y), 2), round(float(box.w), 2), round(float(box.h), 2)],
+    }
+    if frame_shape is not None:
+        data["area_ratio"] = round(area_ratio(box, frame_shape), 4)
+    return data
+
+
 def filter_detection_boxes(
     boxes: list[FaceBox],
     frame_shape: tuple[int, int],
@@ -424,14 +547,7 @@ def filter_detection_boxes(
         if touches_edge and box.confidence < 0.85:
             reasons.append("edge")
         if reasons:
-            rejected.append(
-                {
-                    "source": box.source,
-                    "bbox": [round(float(box.x), 2), round(float(box.y), 2), round(float(box.w), 2), round(float(box.h), 2)],
-                    "area_ratio": round(ratio, 4),
-                    "reasons": reasons,
-                }
-            )
+            rejected.append({"reasons": reasons, **box_to_debug_dict(box, frame_shape)})
         else:
             kept.append(box)
     return kept, rejected
@@ -485,16 +601,20 @@ def update_face_tracks(
     hold_frames: int,
     smoothing: float,
     max_faces: int,
-    head_fallback: str = "off",
+    head_fallback: str = "auto",
     head_confirm_frames: int = 2,
     min_head_confidence: float = 0.65,
     min_face_hits: int = 2,
     max_face_area_ratio: float = 0.20,
     max_box_overlap: float = 0.30,
     cascade_fallback: str = "auto",
+    face_reid_frames: int = 45,
 ) -> FaceTracker:
     max_faces = max(1, int(max_faces))
+    face_reid_frames = max(int(hold_frames), int(face_reid_frames))
     should_detect = not tracker.tracks or frame_index % max(1, detect_interval) == 0
+    active_before = len([track for track in tracker.tracks if track.box is not None])
+    retired_before = len([track for track in tracker.retired_tracks if track.box is not None])
     detections = (
         detector.detect_all(
             digital_frame,
@@ -506,36 +626,59 @@ def update_face_tracks(
         if should_detect
         else []
     )
+    detector_debug = dict(getattr(detector, "last_debug", {}) or {}) if should_detect else {}
     rejected: list[dict] = []
     if should_detect:
         detections, rejected = filter_detection_boxes(detections, digital_frame.shape[:2], max_face_area_ratio)
     stats = {
         "frame_index": int(frame_index),
+        "should_detect": bool(should_detect),
+        "active_tracks_before": int(active_before),
+        "detector": getattr(detector, "name", "none"),
+        "detector_requested_model": getattr(detector, "requested_model", "unknown"),
+        "detect_interval": int(max(1, detect_interval)),
+        "hold_frames": int(hold_frames),
+        "face_reid_frames": int(face_reid_frames),
+        "max_faces": int(max_faces),
+        "head_fallback": head_fallback,
+        "cascade_fallback": cascade_fallback,
+        "same_track_threshold": float(SAME_TRACK_THRESHOLD),
+        "reid_track_threshold": float(REID_TRACK_THRESHOLD),
+        "duplicate_iou_threshold": float(max_box_overlap),
+        "max_face_area_ratio": float(max_face_area_ratio),
+        "detector_debug": detector_debug,
         "raw_detections": int(len(detections) + len(rejected)),
         "kept_detections": int(len(detections)),
+        "kept_by_source": count_boxes_by_source(detections),
         "rejected_detections": int(len(rejected)),
         "rejected": rejected,
         "merged_detections": 0,
         "duplicate_suppressed": 0,
         "new_tracks": 0,
+        "matches": [],
+        "held_tracks": 0,
+        "expired_tracks": 0,
+        "active_retired_tracks_before": int(retired_before),
+        "retired_tracks_after": 0,
+        "reidentified_tracks": 0,
+        "reidentified": [],
     }
     unmatched_detection_indexes = set(range(len(detections)))
+    matched_track_ids: set[int] = set()
 
-    for track in tracker.tracks:
-        if track.box is None:
-            continue
-        if not should_detect:
-            continue
+    if should_detect:
+        match_candidates: list[tuple[float, int, int, FaceTrack]] = []
+        for track in tracker.tracks:
+            if track.box is None:
+                continue
+            for index in unmatched_detection_indexes:
+                score = match_score(track, detections[index])
+                if score >= SAME_TRACK_THRESHOLD:
+                    match_candidates.append((float(score), int(track.track_id), int(index), track))
 
-        best_index = None
-        best_score = 0.0
-        for index in list(unmatched_detection_indexes):
-            score = match_score(track, detections[index])
-            if score > best_score:
-                best_score = score
-                best_index = index
-
-        if best_index is not None and best_score >= 0.18:
+        for best_score, _track_id, best_index, track in sorted(match_candidates, key=lambda item: item[0], reverse=True):
+            if track.track_id in matched_track_ids or best_index not in unmatched_detection_indexes:
+                continue
             new_box = detections[best_index]
             track.box = smooth_box(track.box, new_box, smoothing)
             track.last_seen_frame = frame_index
@@ -546,39 +689,111 @@ def update_face_tracks(
             track.confirmed = track.confirmed or track.hits >= required_hits(new_box.source, min_face_hits, head_confirm_frames)
             track.missed_frames = 0
             track.last_iou_with_existing = float(best_score)
+            matched_track_ids.add(track.track_id)
             unmatched_detection_indexes.remove(best_index)
-        elif track.confirmed and frame_index - track.last_seen_frame <= hold_frames:
+            stats["matches"].append(
+                {
+                    "track_id": int(track.track_id),
+                    "detection_index": int(best_index),
+                    "score": round(float(best_score), 4),
+                    "source": new_box.source,
+                }
+            )
+
+    for track in tracker.tracks:
+        if track.box is None:
+            continue
+        if not should_detect or track.track_id in matched_track_ids:
+            continue
+        if track.confirmed and frame_index - track.last_seen_frame <= hold_frames:
             track.missed_frames += 1
             track.detector_name = "held"
             track.status = "HELD"
+            stats["held_tracks"] += 1
         else:
             track.missed_frames += 1
+            stats["expired_tracks"] += 1
 
-    tracker.tracks = [
-        track
-        for track in tracker.tracks
-        if track.box is not None
-        and (
-            (track.confirmed and frame_index - track.last_seen_frame <= hold_frames)
-            or (not track.confirmed and track.missed_frames <= 0)
-        )
-    ]
+    kept_tracks: list[FaceTrack] = []
+    newly_retired: list[FaceTrack] = []
+    for track in tracker.tracks:
+        if track.box is None:
+            continue
+        age_since_seen = frame_index - track.last_seen_frame
+        if (track.confirmed and age_since_seen <= hold_frames) or (not track.confirmed and track.missed_frames <= 0):
+            kept_tracks.append(track)
+        elif track.confirmed and age_since_seen <= face_reid_frames:
+            track.detector_name = "lost"
+            track.status = "LOST"
+            newly_retired.append(track)
+    tracker.tracks = kept_tracks
+
+    retained_retired: dict[int, FaceTrack] = {}
+    for track in list(tracker.retired_tracks) + newly_retired:
+        if track.box is None or not track.confirmed:
+            continue
+        if frame_index - track.last_seen_frame <= face_reid_frames:
+            retained_retired[int(track.track_id)] = track
+    tracker.retired_tracks = sorted(retained_retired.values(), key=lambda track: track.track_id)
 
     if should_detect:
         current_count = len([track for track in tracker.tracks if track.confirmed])
+        if tracker.retired_tracks and unmatched_detection_indexes:
+            reid_candidates: list[tuple[float, int, int, FaceTrack]] = []
+            for track in tracker.retired_tracks:
+                if track.box is None:
+                    continue
+                for index in unmatched_detection_indexes:
+                    score = match_score(track, detections[index])
+                    if score >= REID_TRACK_THRESHOLD:
+                        reid_candidates.append((float(score), int(track.track_id), int(index), track))
+
+            restored_track_ids: set[int] = set()
+            for best_score, _track_id, best_index, track in sorted(reid_candidates, key=lambda item: item[0], reverse=True):
+                if best_index not in unmatched_detection_indexes or track.track_id in restored_track_ids:
+                    continue
+                if current_count >= max_faces:
+                    break
+                box = detections[best_index]
+                track.box = smooth_box(track.box, box, smoothing)
+                track.last_seen_frame = frame_index
+                track.detector_name = box.source
+                track.last_detector_source = box.source
+                track.status = face_status_from_source(box.source)
+                track.hits += 1
+                track.confirmed = True
+                track.missed_frames = 0
+                track.last_iou_with_existing = float(best_score)
+                track.merged_from = None
+                tracker.tracks.append(track)
+                restored_track_ids.add(track.track_id)
+                unmatched_detection_indexes.remove(best_index)
+                current_count += 1
+                stats["reidentified_tracks"] += 1
+                stats["reidentified"].append(
+                    {
+                        "track_id": int(track.track_id),
+                        "detection_index": int(best_index),
+                        "score": round(float(best_score), 4),
+                        "source": box.source,
+                    }
+                )
+            if restored_track_ids:
+                tracker.retired_tracks = [track for track in tracker.retired_tracks if track.track_id not in restored_track_ids]
+
         for index in sorted(unmatched_detection_indexes, key=lambda idx: detections[idx].confidence, reverse=True):
             box = detections[index]
             overlap_track = None
-            overlap_score = 0.0
+            overlap_iou = 0.0
             for track in tracker.tracks:
                 if track.box is None:
                     continue
-                score = max(box_iou(track.box, box), match_score(track, box))
-                if score > overlap_score:
-                    overlap_score = score
+                score = box_iou(track.box, box)
+                if score > overlap_iou:
+                    overlap_iou = score
                     overlap_track = track
 
-            if overlap_track is not None and overlap_score >= float(max_box_overlap):
+            if overlap_track is not None and overlap_iou >= float(max_box_overlap):
                 if overlap_track.last_seen_frame == frame_index:
                     stats["duplicate_suppressed"] += 1
                 elif overlap_track.confirmed:
@@ -589,7 +804,7 @@ def update_face_tracks(
                     overlap_track.status = face_status_from_source(box.source)
                     overlap_track.hits += 1
                     overlap_track.missed_frames = 0
-                    overlap_track.last_iou_with_existing = float(overlap_score)
+                    overlap_track.last_iou_with_existing = float(overlap_iou)
                     overlap_track.merged_from = None
                     stats["merged_detections"] += 1
                 else:
@@ -625,6 +840,10 @@ def update_face_tracks(
     confirmed_tracks = tracker.active_tracks(confirmed_only=True)
     candidate_tracks = [track for track in tracker.active_tracks() if not track.confirmed]
     tracker.tracks = confirmed_tracks[:max_faces] + candidate_tracks[:max_faces]
+    stats["active_tracks_after"] = int(len([track for track in tracker.tracks if track.box is not None]))
+    stats["confirmed_tracks_after"] = int(len([track for track in tracker.tracks if track.confirmed]))
+    stats["candidate_tracks_after"] = int(len([track for track in tracker.tracks if not track.confirmed]))
+    stats["retired_tracks_after"] = int(len([track for track in tracker.retired_tracks if track.box is not None]))
     tracker.last_stats = stats
     return tracker
 

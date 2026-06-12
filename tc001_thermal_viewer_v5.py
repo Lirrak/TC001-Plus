@@ -100,6 +100,10 @@ class ViewerState:
     unit: str = "C"
     threshold_c: float = 3.0
     signal_threshold: float = 20.0
+    roi_temp_mode: str = "robust"
+    roi_temp_percentile: float = 90.0
+    roi_hot_outlier_delta_c: float = 2.5
+    roi_mask_shrink: float = 0.85
     recording: bool = False
     rotate: int = 0
     flip_h: bool = False
@@ -131,6 +135,20 @@ class Alignment:
     matrix: Optional[np.ndarray] = None
     digital_size: Optional[Tuple[int, int]] = None
     thermal_size: Optional[Tuple[int, int]] = None
+
+
+@dataclass
+class RoiTemperatureStats:
+    person_temp_c: Optional[float]
+    max_temp_c: Optional[float]
+    median_temp_c: Optional[float]
+    percentile_temp_c: Optional[float]
+    hot_outlier_delta_c: Optional[float]
+    hot_outlier_pixels: int
+    roi_pixels: int
+    used_pixels: int
+    roi_temp_contaminated: bool
+    mode: str
 
 
 def timestamp() -> str:
@@ -691,17 +709,109 @@ def inverse_orient_points(points: np.ndarray, raw_shape: Tuple[int, int], state:
     return out
 
 
-def polygon_max_temperature_c(temp_c: Optional[np.ndarray], polygon: np.ndarray) -> Optional[float]:
+def shrink_polygon(points: np.ndarray, scale: float) -> np.ndarray:
+    scale = min(max(float(scale), 0.1), 1.0)
+    pts = points.astype(np.float32).reshape(-1, 2)
+    if pts.size == 0 or scale >= 0.999:
+        return pts
+    center = np.mean(pts, axis=0, keepdims=True)
+    return center + (pts - center) * scale
+
+
+def polygon_temperature_values(
+    temp_c: Optional[np.ndarray],
+    polygon: np.ndarray,
+    mask_shrink: float = 1.0,
+) -> np.ndarray:
     if temp_c is None or temp_c.size == 0 or polygon.size == 0:
-        return None
+        return np.asarray([], dtype=np.float32)
     mask = np.zeros(temp_c.shape[:2], dtype=np.uint8)
-    pts = np.round(polygon).astype(np.int32).reshape(-1, 1, 2)
+    pts = np.round(shrink_polygon(polygon, mask_shrink)).astype(np.int32).reshape(-1, 1, 2)
     cv2.fillPoly(mask, [pts], 255)
     values = temp_c[mask > 0]
     values = values[np.isfinite(values)]
+    if values.size == 0 and mask_shrink < 0.999:
+        mask.fill(0)
+        pts = np.round(polygon).astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(mask, [pts], 255)
+        values = temp_c[mask > 0]
+        values = values[np.isfinite(values)]
+    return values.astype(np.float32, copy=False)
+
+
+def polygon_temperature_stats(
+    temp_c: Optional[np.ndarray],
+    polygon: np.ndarray,
+    mode: str = "robust",
+    percentile: float = 90.0,
+    hot_outlier_delta_c: float = 2.5,
+    mask_shrink: float = 0.85,
+) -> RoiTemperatureStats:
+    values = polygon_temperature_values(temp_c, polygon, mask_shrink)
+    mode = (mode or "robust").lower()
     if values.size == 0:
-        return None
-    return float(np.nanmax(values))
+        return RoiTemperatureStats(None, None, None, None, None, 0, 0, 0, False, mode)
+
+    percentile = min(max(float(percentile), 50.0), 99.0)
+    hot_outlier_delta_c = max(0.1, float(hot_outlier_delta_c))
+    max_temp = float(np.nanmax(values))
+    median_temp = float(np.nanmedian(values))
+
+    if mode == "max":
+        return RoiTemperatureStats(max_temp, max_temp, median_temp, max_temp, 0.0, 0, int(values.size), int(values.size), False, mode)
+
+    q25, q75 = np.nanpercentile(values, [25.0, 75.0])
+    iqr = max(float(q75 - q25), 0.0)
+    iqr_cutoff = float(q75) + max(1.0, 1.5 * iqr)
+    delta_cutoff = median_temp + hot_outlier_delta_c
+    cutoff = max(float(q75), min(delta_cutoff, iqr_cutoff))
+
+    filtered = values[values <= cutoff]
+    min_used = max(8, int(values.size * 0.25))
+    if filtered.size < min_used:
+        fallback_cutoff = median_temp + hot_outlier_delta_c
+        fallback = values[values <= fallback_cutoff]
+        filtered = fallback if fallback.size >= min_used else values
+        cutoff = fallback_cutoff if fallback.size >= min_used else max_temp
+
+    percentile_temp = float(np.nanpercentile(filtered, percentile))
+    person_temp = percentile_temp
+    hot_pixels = int(np.count_nonzero(values > cutoff))
+    hot_delta = max_temp - person_temp
+    contaminated = bool(hot_pixels > 0 and hot_delta >= hot_outlier_delta_c)
+    return RoiTemperatureStats(
+        person_temp_c=person_temp,
+        max_temp_c=max_temp,
+        median_temp_c=median_temp,
+        percentile_temp_c=percentile_temp,
+        hot_outlier_delta_c=float(hot_delta),
+        hot_outlier_pixels=hot_pixels,
+        roi_pixels=int(values.size),
+        used_pixels=int(filtered.size),
+        roi_temp_contaminated=contaminated,
+        mode=mode,
+    )
+
+
+def polygon_max_temperature_c(temp_c: Optional[np.ndarray], polygon: np.ndarray) -> Optional[float]:
+    return polygon_temperature_stats(temp_c, polygon, mode="max", mask_shrink=1.0).max_temp_c
+
+
+def polygon_temperature_stats_for_state(
+    temp_c: Optional[np.ndarray],
+    polygon: np.ndarray,
+    state: Optional[ViewerState],
+) -> RoiTemperatureStats:
+    if state is None:
+        return polygon_temperature_stats(temp_c, polygon)
+    return polygon_temperature_stats(
+        temp_c,
+        polygon,
+        mode=state.roi_temp_mode,
+        percentile=state.roi_temp_percentile,
+        hot_outlier_delta_c=state.roi_hot_outlier_delta_c,
+        mask_shrink=state.roi_mask_shrink,
+    )
 
 
 def draw_one_face_overlay(
@@ -734,9 +844,11 @@ def draw_one_face_overlay(
     cv2.polylines(img, [pts_i], isClosed=True, color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
     status = track.status if track.status and track.status != "NO FACE" else "FACE"
     label = f"P{track.track_id} {status} {track.box.confidence * 100:.0f}%"
-    face_temp_c = polygon_max_temperature_c(raw_thermal.temp_c, mapped)
-    if face_temp_c is not None:
-        label += f" | max {fmt_temp(face_temp_c, state.unit, raw_thermal.approx_temps)}"
+    temp_stats = polygon_temperature_stats_for_state(raw_thermal.temp_c, mapped, state)
+    if temp_stats.person_temp_c is not None:
+        label += f" | temp {fmt_temp(temp_stats.person_temp_c, state.unit, raw_thermal.approx_temps)}"
+        if temp_stats.roi_temp_contaminated:
+            label += " !hot"
     x = int(np.min(draw_pts[:, 0]))
     y = int(np.min(draw_pts[:, 1]))
     put_text(img, label, (max(8, x), max(22, y - 8)), scale=0.45, color=(0, 255, 0))
@@ -799,6 +911,8 @@ def build_detection_debug_record(
     tracker: FaceTracker,
     raw_thermal: ThermalFrame,
     alignment: Alignment,
+    config: Optional[dict] = None,
+    state: Optional[ViewerState] = None,
 ) -> dict:
     raw_thermal_shape = raw_thermal.temp_c.shape[:2] if raw_thermal.temp_c is not None else raw_thermal.display_source.shape[:2]
     tracks = []
@@ -806,7 +920,7 @@ def build_detection_debug_record(
         if track.box is None:
             continue
         mapped = map_points_to_thermal(face_box_points(track.box), digital_shape, raw_thermal_shape, alignment)
-        max_temp_c = polygon_max_temperature_c(raw_thermal.temp_c, mapped) if mapped is not None else None
+        temp_stats = polygon_temperature_stats_for_state(raw_thermal.temp_c, mapped, state) if mapped is not None else None
         tracks.append(
             {
                 "track_id": int(track.track_id),
@@ -830,13 +944,25 @@ def build_detection_debug_record(
                 "thermal_polygon": None
                 if mapped is None
                 else [[round(float(x), 2), round(float(y), 2)] for x, y in mapped.tolist()],
-                "max_temp_c": None if max_temp_c is None else round(float(max_temp_c), 2),
+                "person_temp_c": None if temp_stats is None or temp_stats.person_temp_c is None else round(float(temp_stats.person_temp_c), 2),
+                "max_temp_c": None if temp_stats is None or temp_stats.max_temp_c is None else round(float(temp_stats.max_temp_c), 2),
+                "median_temp_c": None if temp_stats is None or temp_stats.median_temp_c is None else round(float(temp_stats.median_temp_c), 2),
+                "percentile_temp_c": None if temp_stats is None or temp_stats.percentile_temp_c is None else round(float(temp_stats.percentile_temp_c), 2),
+                "hot_outlier_delta_c": None
+                if temp_stats is None or temp_stats.hot_outlier_delta_c is None
+                else round(float(temp_stats.hot_outlier_delta_c), 2),
+                "hot_outlier_pixels": 0 if temp_stats is None else int(temp_stats.hot_outlier_pixels),
+                "roi_pixels": 0 if temp_stats is None else int(temp_stats.roi_pixels),
+                "used_pixels": 0 if temp_stats is None else int(temp_stats.used_pixels),
+                "roi_temp_contaminated": False if temp_stats is None else bool(temp_stats.roi_temp_contaminated),
+                "roi_temp_mode": None if temp_stats is None else temp_stats.mode,
             }
         )
     return {
         "frame_index": int(frame_index),
         "digital_size": [int(digital_shape[1]), int(digital_shape[0])],
         "alignment": alignment.mode,
+        "config": config or {},
         "summary": tracker.last_stats,
         "tracks": tracks,
     }
@@ -847,7 +973,7 @@ def emit_detection_debug(record: dict, debug_console: bool, debug_file: Optional
         brief = [
             f"P{track['track_id']}:{track['source']}:{track['last_detector_source']}:{track['status']}:"
             f"{'ok' if track['confirmed'] else 'cand'}:"
-            f"bbox={track['bbox']}:max={track['max_temp_c']}"
+            f"bbox={track['bbox']}:temp={track.get('person_temp_c')}:max={track.get('max_temp_c')}"
             for track in record.get("tracks", [])
         ]
         summary = record.get("summary", {}) or {}
@@ -1487,6 +1613,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-estimate-temps", dest="estimate_temps", action="store_false", help="Disable temperature estimation.")
     parser.add_argument("--temp-scale", type=float, default=1.0, help="Calibration scale applied to decoded/estimated Celsius. Default: 1.0.")
     parser.add_argument("--temp-offset", type=float, default=0.0, help="Calibration offset in Celsius. Default: 0.0.")
+    parser.add_argument("--roi-temp-mode", choices=["robust", "max"], default="robust", help="Face ROI temperature mode. robust ignores small hot outliers; max keeps old behavior. Default: robust.")
+    parser.add_argument("--roi-temp-percentile", type=float, default=90.0, help="Percentile used for robust face ROI temperature. Default: 90.")
+    parser.add_argument("--roi-hot-outlier-delta-c", type=float, default=2.5, help="Hot outlier delta above ROI median in Celsius. Default: 2.5.")
+    parser.add_argument("--roi-mask-shrink", type=float, default=0.85, help="Shrink mapped ROI polygon before measuring temperature. Default: 0.85.")
     parser.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=90, help="Initial clockwise rotation for the thermal viewer. Default: 90.")
     parser.add_argument("--flip-h", action="store_true", help="Initial horizontal mirror flip.")
     parser.add_argument("--flip-v", action="store_true", help="Initial vertical flip.")
@@ -1507,13 +1637,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--face-min-confidence", type=float, default=0.55, help="Minimum MediaPipe face confidence. Default: 0.55.")
     parser.add_argument("--face-detect-interval", type=int, default=3, help="Run face detection every N frames, then track/smooth between detections. Default: 3.")
     parser.add_argument("--face-hold-frames", type=int, default=15, help="Keep the last face box for this many frames after missed detections. Default: 15.")
+    parser.add_argument("--face-reid-frames", type=int, default=45, help="Keep recently lost confirmed tracks for re-identification without drawing them. Default: 45.")
     parser.add_argument("--face-smoothing", type=float, default=0.65, help="EMA smoothing for face box coordinates. Default: 0.65.")
     parser.add_argument("--min-face-hits", type=int, default=2, help="Detection hits required before Haar/profile tracks are shown. Default: 2.")
     parser.add_argument("--max-face-area-ratio", type=float, default=0.20, help="Reject face boxes larger than this frame area ratio. Default: 0.20.")
-    parser.add_argument("--max-box-overlap", type=float, default=0.30, help="Merge/suppress new boxes overlapping existing tracks above this score. Default: 0.30.")
+    parser.add_argument("--max-box-overlap", type=float, default=0.30, help="IoU threshold used to merge/suppress duplicate boxes. Default: 0.30.")
     parser.add_argument("--cascade-fallback", choices=["off", "auto", "always"], default="auto", help="Use Haar/profile cascade fallback. Default: auto.")
     parser.add_argument("--max-faces", type=int, default=5, help="Maximum number of people/face tracks to show. Default: 5.")
-    parser.add_argument("--head-fallback", choices=["off", "auto", "always"], default="off", help="Use thermal/bright-region head fallback. Default: off for stable ROI.")
+    parser.add_argument("--head-fallback", choices=["off", "auto", "always"], default="auto", help="Use bright-region head fallback when face/profile detection misses. Default: auto.")
     parser.add_argument("--head-confirm-frames", type=int, default=2, help="Detection frames required before showing a HEAD TRACK on thermal view. Default: 2.")
     parser.add_argument("--min-head-confidence", type=float, default=0.65, help="Assigned confidence for accepted head fallback boxes. Default: 0.65.")
     parser.add_argument("--debug-detections", action="store_true", help="Print face/ROI detection data every --debug-detections-every frames.")
@@ -1571,6 +1702,10 @@ def main() -> int:
         zoom=max(1, int(args.zoom)),
         threshold_c=max(0.0, float(args.threshold)),
         signal_threshold=max(0.0, float(args.signal_threshold)),
+        roi_temp_mode=args.roi_temp_mode,
+        roi_temp_percentile=float(args.roi_temp_percentile),
+        roi_hot_outlier_delta_c=max(0.1, float(args.roi_hot_outlier_delta_c)),
+        roi_mask_shrink=min(max(float(args.roi_mask_shrink), 0.1), 1.0),
         rotate=int(args.rotate),
         flip_h=bool(args.flip_h),
         flip_v=bool(args.flip_v),
@@ -1809,6 +1944,7 @@ def main() -> int:
                         args.max_face_area_ratio,
                         args.max_box_overlap,
                         args.cascade_fallback,
+                        args.face_reid_frames,
                     )
 
             if sdk_cam is not None and temp_c is not None:
@@ -1834,13 +1970,45 @@ def main() -> int:
             if digital_frame is not None and args.face_detect:
                 if args.debug_detections or detection_debug_file is not None:
                     every = max(1, int(args.debug_detections_every))
-                    if frame_index % every == 0:
+                    stats = face_tracker.last_stats or {}
+                    should_emit_detection_debug = frame_index % every == 0 or bool(
+                        stats.get("new_tracks")
+                        or stats.get("reidentified_tracks")
+                        or stats.get("merged_detections")
+                        or stats.get("duplicate_suppressed")
+                        or stats.get("rejected_detections")
+                        or len(face_tracker.active_tracks(confirmed_only=True)) >= 2
+                    )
+                    if should_emit_detection_debug:
                         record = build_detection_debug_record(
                             frame_index,
                             digital_frame.shape[:2],
                             face_tracker,
                             thermal_raw,
                             alignment,
+                            {
+                                "digital_source": args.digital_source,
+                                "digital_split": args.digital_split,
+                                "digital_rotate": int(args.digital_rotate),
+                                "face_model": args.face_model,
+                                "detector": face_detector.name if face_detector is not None else "none",
+                                "max_faces": int(args.max_faces),
+                                "face_detect_interval": int(args.face_detect_interval),
+                                "face_hold_frames": int(args.face_hold_frames),
+                                "face_reid_frames": int(args.face_reid_frames),
+                                "face_smoothing": float(args.face_smoothing),
+                                "roi_temp_mode": state.roi_temp_mode,
+                                "roi_temp_percentile": float(state.roi_temp_percentile),
+                                "roi_hot_outlier_delta_c": float(state.roi_hot_outlier_delta_c),
+                                "roi_mask_shrink": float(state.roi_mask_shrink),
+                                "min_face_hits": int(args.min_face_hits),
+                                "max_face_area_ratio": float(args.max_face_area_ratio),
+                                "max_box_overlap": float(args.max_box_overlap),
+                                "cascade_fallback": args.cascade_fallback,
+                                "head_fallback": args.head_fallback,
+                                "alignment": alignment.mode,
+                            },
+                            state=state,
                         )
                         emit_detection_debug(record, bool(args.debug_detections), detection_debug_file)
                 draw_face_overlay(heatmap, thermal_raw, thermal, digital_frame.shape[:2], face_tracker, alignment, state)
