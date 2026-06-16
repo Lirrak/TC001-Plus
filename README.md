@@ -147,13 +147,13 @@ py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --m
 Luu log JSONL de xem data bbox/ROI/nhiet do tra ra:
 
 ```powershell
-py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback off --debug-detections --save-detection-debug detections_debug.jsonl
+py .\tc001_thermal_viewer_v5.py --sdk-raw --face-detect --show-digital-debug --max-faces 2 --head-fallback off --debug-detections --save-detection-debug .\logs\detections\detections_debug.jsonl
 ```
 
 Doc report tu file JSONL:
 
 ```powershell
-py .\tools\analyze_detections.py .\detections_debug.jsonl
+py .\tools\analyze_detections.py .\logs\detections\detections_debug.jsonl
 ```
 
 Neu can thu bat mat nghieng bang fallback head:
@@ -254,6 +254,9 @@ tc001_face.py                    Face detector va face tracking
 tc001_alignment.json             Local calibration file, khong commit vao repo
 tools/probes/                    Script probe SDK/libusb/TopView
 tools/experiments/               Script thu nghiem raw frame
+tests/                           Unit tests cho face tracking/ROI
+docs/                            Ghi chu va lenh chay bo sung
+logs/detections/                 Log JSONL debug face/ROI/detection
 archive/legacy_viewers/          Cac ban viewer cu
 captures/                        Anh/raw frame mau de debug
 downloads/                       File tai ve phuc vu nghien cuu
@@ -282,7 +285,7 @@ Trang thai hien tai:
 - `--max-face-area-ratio 0.20`: reject box qua lon de tranh ROI phu vai/nguc/nen.
 - `--max-box-overlap 0.30`: merge/suppress box moi neu trung track cu.
 - `--debug-detections`: in data bbox/ROI/nhiet do ra console.
-- `--save-detection-debug detections_debug.jsonl`: luu data audit dang JSONL.
+- `--save-detection-debug .\logs\detections\detections_debug.jsonl`: luu data audit dang JSONL.
 - `--face-model tasks --face-task-model ...`: dung MediaPipe Tasks face detector
   neu da co model `.tflite`.
 - Label `P1 FACE xx% | max yy.y degC`: hien thi nhiet do cao nhat trong ROI

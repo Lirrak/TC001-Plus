@@ -403,7 +403,9 @@ class DigitalFaceDetector:
             box = self._clip_box(FaceBox(float(bx), float(by), float(box_w), float(box_h), confidence, "head"), frame_w, frame_h)
             ratio = area_ratio(box, (frame_h, frame_w))
             aspect = box.w / max(box.h, 1.0)
-            if 0.035 <= ratio <= 0.20 and 0.45 <= aspect <= 1.45:
+            contour_fill = area / max(float(uw * uh), 1.0)
+            box_fill = area / max(float(box.w * box.h), 1.0)
+            if 0.035 <= ratio <= 0.20 and 0.45 <= aspect <= 1.45 and contour_fill >= 0.35 and box_fill >= 0.20:
                 candidates.append(box)
 
         return self._nms(candidates, iou_threshold=0.30, max_boxes=2)

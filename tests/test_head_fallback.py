@@ -24,6 +24,20 @@ class HeadFallbackTests(unittest.TestCase):
         self.assertLessEqual((best.w * best.h) / float(gray.shape[0] * gray.shape[1]), 0.20)
         self.assertGreaterEqual(best.w, gray.shape[1] * 0.16)
 
+    def test_sparse_bright_lamp_contour_does_not_yield_head_box(self):
+        detector = DigitalFaceDetector(model="haar")
+        mask = np.zeros((256, 192), dtype=np.uint8)
+
+        cv2.line(mask, (72, 10), (72, 112), 255, 3)
+        cv2.circle(mask, (72, 128), 18, 255, -1)
+
+        contours, _hierarchy = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        self.assertEqual(len(contours), 1)
+
+        boxes = detector._detect_head_from_large_contour(mask, contours[0], 0.65)
+
+        self.assertEqual(boxes, [])
+
 
 if __name__ == "__main__":
     unittest.main()
